@@ -247,6 +247,7 @@ int z_erofs_load_deflate_config(struct erofs_sb_info *sbi,
 #ifdef HAVE_LIBDEFLATE
 /* if libdeflate is available, use libdeflate instead. */
 #include <libdeflate.h>
+#define Z_EROFS_MAX_DECOMP_CAPACITY	(64U << 20)	/* 64 MiB ceiling */
 
 static int z_erofs_decompress_deflate(struct z_erofs_decompress_req *rq)
 {
@@ -288,6 +289,11 @@ static int z_erofs_decompress_deflate(struct z_erofs_decompress_req *rq)
 				ret = -EIO;
 				goto out_inflate_end;
 			}
+		if (decodedcapacity >= Z_EROFS_MAX_DECOMP_CAPACITY) {
+			erofs_err("deflate partial decompression capacity limit exceeded");
+			ret = -EFSCORRUPTED;
+			goto out_inflate_end;
+		}
 			decodedcapacity = decodedcapacity << 1;
 			dest = realloc(buff, decodedcapacity);
 			if (!dest) {
