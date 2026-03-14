@@ -723,10 +723,20 @@ int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar)
 	int ckksum, ret, rem, j;
 
 	root->dev = tar->dev;
-	if (eh.path)
+	if (eh.path) {
 		eh.path = strdup(eh.path);
-	if (eh.link)
+		if (!eh.path) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	if (eh.link) {
 		eh.link = strdup(eh.link);
+		if (!eh.link) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
 	init_list_head(&eh.xattrs);
 
 restart:
