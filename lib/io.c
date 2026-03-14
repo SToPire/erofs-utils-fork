@@ -191,7 +191,10 @@ int erofs_io_fallocate(struct erofs_vfile *vf, u64 offset,
 		len -= ret;
 		offset += ret;
 	}
-	return erofs_io_pwrite(vf, erofs_zeroed, offset, len) == len ? 0 : -EIO;
+	ret = erofs_io_pwrite(vf, erofs_zeroed, offset, len);
+	if (ret != (ssize_t)len)
+		return ret < 0 ? (int)ret : -EIO;
+	return 0;
 }
 
 int erofs_io_ftruncate(struct erofs_vfile *vf, u64 length)
