@@ -1182,6 +1182,26 @@ static int erofs_init_inode_xattrs(struct erofs_inode *vi)
 
 	ih = it.kaddr;
 	vi->xattr_shared_count = ih->h_shared_count;
+
+	/*
+	 * Validate that the claimed number of shared xattr index entries
+	 * actually fits within the inode's declared xattr_isize.
+	 * h_shared_count is a raw u8 read from the on-disk image; a crafted
+	 * image could set h_shared_count=255 with xattr_isize=12 (header only),
+	 * causing the loop below to read h_shared_count*4 bytes past the xattr
+	 * region into adjacent inode metadata.  Those harvested values are later
+	 * used as block offsets in erofs_xattr_iter_shared(), making this an
+	 * arbitrary-read-within-image primitive.
+	 */
+	if (vi->xattr_shared_count &&
+	    (unsigned int)vi->xattr_shared_count * sizeof(__le32) >
+	    vi->xattr_isize - sizeof(struct erofs_xattr_ibody_header)) {
+		erofs_err("xattr_shared_count %u exceeds xattr_isize %u for nid %llu",
+			  vi->xattr_shared_count, vi->xattr_isize,
+			  (unsigned long long)vi->nid);
+		erofs_put_metabuf(&it.buf);
+		return -EFSCORRUPTED;
+	}
 	vi->xattr_shared_xattrs = malloc(vi->xattr_shared_count * sizeof(uint));
 	if (!vi->xattr_shared_xattrs) {
 		erofs_put_metabuf(&it.buf);
