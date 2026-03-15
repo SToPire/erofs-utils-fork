@@ -38,7 +38,6 @@ static char *docker_config_path(void)
 {
 	const char *dir;
 	char *path = NULL;
-
 	dir = getenv("DOCKER_CONFIG");
 	if (dir) {
 		if (!*dir)
@@ -203,6 +202,8 @@ int erofs_docker_config_lookup(const char *registry,
 		}
 
 		entry = json_object_iter_peek_value(&it);
+                if (!entry)
+			continue;
 		if (json_object_object_get_ex(entry, "auth", &auth_field)) {
 			b64 = json_object_get_string(auth_field);
 			if (b64 && *b64) {
