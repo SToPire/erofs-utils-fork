@@ -636,8 +636,17 @@ static int z_erofs_map_blocks_ext(struct erofs_inode *vi,
 			if (map->m_plen & Z_EROFS_EXTENT_PLEN_PARTIAL)
 				map->m_flags |= EROFS_MAP_PARTIAL_REF;
 			map->m_plen &= Z_EROFS_EXTENT_PLEN_MASK;
-			if (fmt)
-				map->m_algorithmformat = fmt - 1;
+			if (fmt) {
+				unsigned int afmt = fmt - 1;
+
+				if (afmt >= Z_EROFS_COMPRESSION_MAX ||
+				    !(sbi->available_compr_algs & (1 << afmt))) {
+					erofs_err("unknown algorithm %u for encoded extent, nid %llu",
+						  afmt, vi->nid | 0ULL);
+					return -EOPNOTSUPP;
+				}
+				map->m_algorithmformat = afmt;
+			}
 			else if (interlaced && !((map->m_pa | map->m_plen) & bmask))
 				map->m_algorithmformat =
 					Z_EROFS_COMPRESSION_INTERLACED;
