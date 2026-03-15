@@ -196,12 +196,15 @@ int erofs_iterate_dir(struct erofs_dir_context *ctx, bool fsck)
 
 #define EROFS_PATHNAME_FOUND 1
 
+#define EROFS_GET_PATHNAME_MAX_DEPTH	64
+
 struct erofs_get_pathname_context {
 	struct erofs_dir_context ctx;
 	erofs_nid_t target_nid;
 	char *buf;
 	size_t size;
 	size_t pos;
+	unsigned int depth;
 };
 
 static int erofs_get_pathname_iter(struct erofs_dir_context *ctx)
@@ -249,7 +252,14 @@ static int erofs_get_pathname_iter(struct erofs_dir_context *ctx)
 				.buf = pathctx->buf,
 				.size = pathctx->size,
 				.pos = pos + len + 1,
+				.depth = pathctx->depth + 1,
 			};
+			if (pathctx->depth >= EROFS_GET_PATHNAME_MAX_DEPTH) {
+				erofs_err("pathname lookup depth exceeds %u, nid %llu",
+					  EROFS_GET_PATHNAME_MAX_DEPTH,
+					  dir.nid | 0ULL);
+				return -ELOOP;
+			}
 			ret = erofs_iterate_dir(&nctx.ctx, false);
 			if (ret == EROFS_PATHNAME_FOUND) {
 				pathctx->buf[pos++] = '/';
