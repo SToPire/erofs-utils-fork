@@ -4,6 +4,7 @@
  * Created by Huang Jianan <huangjianan@oppo.com>
  */
 #include <stdlib.h>
+#include <stdint.h>
 
 #include "erofs/decompress.h"
 #include "erofs/err.h"
@@ -258,13 +259,13 @@ static int z_erofs_decompress_deflate(struct z_erofs_decompress_req *rq)
 	unsigned int inputmargin;
 	struct libdeflate_decompressor *inf;
 	enum libdeflate_result ret;
-	unsigned int decodedcapacity;
+	size_t decodedcapacity;
 
 	inputmargin = z_erofs_fixup_insize(src, rq->inputsize);
 	if (inputmargin >= rq->inputsize)
 		return -EFSCORRUPTED;
 
-	decodedcapacity = rq->decodedlength << (4 * rq->partial_decoding);
+	decodedcapacity = (size_t)rq->decodedlength << (4 * rq->partial_decoding);
 	if (rq->decodedskip || rq->partial_decoding) {
 		buff = malloc(decodedcapacity);
 		if (!buff)
@@ -294,7 +295,12 @@ static int z_erofs_decompress_deflate(struct z_erofs_decompress_req *rq)
 			ret = -EFSCORRUPTED;
 			goto out_inflate_end;
 		}
-			decodedcapacity = decodedcapacity << 1;
+			if (decodedcapacity > SIZE_MAX >> 1) {
+				erofs_err("inflate: decompression buffer overflow");
+				ret = -EFSCORRUPTED;
+				goto out_inflate_end;
+			}
+			decodedcapacity <<= 1;
 			dest = realloc(buff, decodedcapacity);
 			if (!dest) {
 				ret = -ENOMEM;
