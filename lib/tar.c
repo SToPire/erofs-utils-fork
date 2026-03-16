@@ -897,6 +897,10 @@ out_eot:
 	case 'L':
 		free(eh.path);
 		eh.path = malloc(st.st_size + 1);
+		if (!eh.path) {
+			ret = -ENOMEM;
+			goto out;
+		}
 		if (st.st_size != erofs_iostream_bread(&tar->ios, eh.path,
 						       st.st_size))
 			goto invalid_tar;
@@ -905,6 +909,10 @@ out_eot:
 	case 'K':
 		free(eh.link);
 		eh.link = malloc(st.st_size + 1);
+		if (!eh.link) {
+			ret = -ENOMEM;
+			goto out;
+		}
 		if (st.st_size > PATH_MAX || st.st_size !=
 		    erofs_iostream_bread(&tar->ios, eh.link, st.st_size))
 			goto invalid_tar;
