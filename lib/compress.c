@@ -1427,6 +1427,8 @@ void *z_erofs_mt_wq_tls_alloc(struct erofs_workqueue *wq, void *ptr)
 {
 	struct erofs_compress_wq_tls *tls;
 
+	erofs_set_thread_name("erofscompressor");
+
 	tls = calloc(1, sizeof(*tls));
 	if (!tls)
 		return NULL;

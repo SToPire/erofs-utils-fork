@@ -31,4 +31,6 @@ int erofs_alloc_workqueue(struct erofs_workqueue *wq, unsigned int nworker,
 			  erofs_wq_func_t on_exit);
 int erofs_queue_work(struct erofs_workqueue *wq, struct erofs_work *work);
 int erofs_destroy_workqueue(struct erofs_workqueue *wq);
+
+void erofs_set_thread_name(const char *name);
 #endif

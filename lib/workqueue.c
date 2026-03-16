@@ -4,6 +4,19 @@
 #include "erofs/print.h"
 #include "erofs/workqueue.h"
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
+void erofs_set_thread_name(const char *name)
+{
+#if defined(__linux__)
+	prctl(PR_SET_NAME, name);
+#elif defined(__APPLE__)
+	pthread_setname_np(name);
+#endif
+}
+
 static void *worker_thread(void *arg)
 {
 	struct erofs_workqueue *wq = arg;
