@@ -518,6 +518,13 @@ int z_erofs_decompress(struct z_erofs_decompress_req *rq)
 {
 	struct erofs_sb_info *sbi = rq->sbi;
 
+	/* reject decodedskip exceeding decodedlength to avoid underflow */
+	if (rq->decodedlength < rq->decodedskip) {
+		erofs_err("bogus decodedskip %u > decodedlength %u",
+			  rq->decodedskip, rq->decodedlength);
+		return -EFSCORRUPTED;
+	}
+
 	if (rq->alg == Z_EROFS_COMPRESSION_INTERLACED) {
 		unsigned int count, rightpart, skip;
 
