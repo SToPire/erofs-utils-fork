@@ -550,6 +550,11 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 					ret = -EIO;
 					goto out;
 				}
+                                if (lln < 0) {
+                                	erofs_err("invalid negative size= in PAX header");
+                                	ret = -EINVAL;
+                                	goto out;
+                                }
 				eh->st.st_size = lln;
 				eh->use_size = true;
 			} else if (!strncmp(kv, "uid=", sizeof("uid=") - 1)) {
