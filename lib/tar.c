@@ -556,12 +556,22 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 					ret = -EIO;
 					goto out;
 				}
+				if (lln < 0) {
+					erofs_err("invalid negative uid= in PAX header");
+					ret = -EINVAL;
+					goto out;
+				}
 				eh->st.st_uid = lln;
 				eh->use_uid = true;
 			} else if (!strncmp(kv, "gid=", sizeof("gid=") - 1)) {
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
+					goto out;
+				}
+				if (lln < 0) {
+					erofs_err("invalid negative gid= in PAX header");
+					ret = -EINVAL;
 					goto out;
 				}
 				eh->st.st_gid = lln;
