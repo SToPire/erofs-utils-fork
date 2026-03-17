@@ -681,8 +681,26 @@ static int z_erofs_fill_inode_lazy(struct erofs_inode *vi)
 	vi->z_lclusterbits = sbi->blkszbits + (h->h_clusterbits & 15);
 	if (vi->datalayout == EROFS_INODE_COMPRESSED_FULL &&
 	    (vi->z_advise & Z_EROFS_ADVISE_EXTENTS)) {
+		u64 max_extents;
+
 		vi->z_extents = le32_to_cpu(h->h_extents_lo) |
 			((u64)le16_to_cpu(h->h_extents_hi) << 32);
+
+		/*
+		 * Each extent covers at least one logical cluster, so
+		 * the extent count must not exceed the number of lclusters.
+		 * Reject bogus values to prevent out-of-bounds metadata
+		 * reads in z_erofs_map_blocks_ext().
+		 */
+		max_extents = DIV_ROUND_UP(vi->i_size,
+					   1ULL << vi->z_lclusterbits);
+		if (vi->z_extents > max_extents) {
+			erofs_err("bogus z_extents %llu (max %llu) for nid %llu",
+				  vi->z_extents | 0ULL, max_extents | 0ULL,
+				  vi->nid | 0ULL);
+			err = -EFSCORRUPTED;
+			goto out_put_metabuf;
+		}
 		goto done;
 	}
 	vi->z_algorithmtype[0] = h->h_algorithmtype & 15;
