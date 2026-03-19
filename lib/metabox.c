@@ -62,7 +62,6 @@ int erofs_metadata_init(struct erofs_sb_info *sbi)
 		if (ret)
 			goto err_free;
 		sbi->m2gr = m2gr;
-		/* FIXME: sbi->meta_blkaddr should be 0 for 48-bit layouts */
 		sbi->meta_blkaddr = EROFS_META_NEW_ADDR;
 	}
 

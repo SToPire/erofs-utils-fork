@@ -209,7 +209,7 @@ int erofs_writesb(struct erofs_sb_info *sbi)
 		.epoch     = cpu_to_le64(sbi->epoch),
 		.build_time = cpu_to_le64(sbi->build_time),
 		.fixed_nsec = cpu_to_le32(sbi->fixed_nsec),
-		.meta_blkaddr  = cpu_to_le32(sbi->meta_blkaddr),
+		.meta_blkaddr  = cpu_to_le32(erofs_sb_has_48bit(sbi) ? 0 : sbi->meta_blkaddr),
 		.xattr_blkaddr = cpu_to_le32(sbi->xattr_blkaddr),
 		.xattr_prefix_count = sbi->xattr_prefix_count,
 		.xattr_prefix_start = cpu_to_le32(sbi->xattr_prefix_start),
