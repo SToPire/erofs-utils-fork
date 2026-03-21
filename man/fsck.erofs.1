@@ -34,7 +34,10 @@ take a long time depending on the image size.
 
 Optionally extract contents of the \fIIMAGE\fR to \fIdirectory\fR.
 .TP
-.B "--no-sbcrc"
+.BI "\-\-offset=" #
+Skip # bytes at the beginning of IMAGE.
+.TP
+.B "\-\-no\-sbcrc"
 Bypass the on-disk superblock checksum verification.
 .TP
 .BI "\-\-nid=" #
@@ -45,11 +48,31 @@ The default is the root inode.
 Specify the target inode by its path for checking or extraction. If both
 \fB\-\-nid\fR and \fB\-\-path\fR are specified, \fB\-\-path\fR takes precedence.
 .TP
-.BI "--[no-]xattrs"
+.BI "\-\-[no\-]xattrs"
 Whether to dump extended attributes during extraction (default off).
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Display help string and exit.
+.PP
+The following options are only meaningful when used with \fB\-\-extract\fR=\fIX\fR:
+.TP
+.B \-\-force
+Allow extracting to the root directory.
+.TP
+.B \-\-overwrite
+Overwrite files that already exist.
+.TP
+.B "\-\-[no\-]preserve"
+Same as \fB\-\-[no\-]preserve\-owner\fR \fB\-\-[no\-]preserve\-perms\fR.
+.TP
+.B "\-\-[no\-]preserve\-owner"
+Whether to preserve the ownership from the filesystem (default for
+superuser), or to extract as yourself (default for ordinary users).
+.TP
+.B "\-\-[no\-]preserve\-perms"
+Whether to preserve the exact permissions from the filesystem without
+applying umask (default for superuser), or to modify the permissions
+by applying umask (default for ordinary users).
 .TP
 \fB\-a\fR, \fB\-A\fR, \fB-y\fR
 These options do nothing at all; they are provided only for compatibility with
