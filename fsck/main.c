@@ -4,6 +4,7 @@
  * Author: Daeho Jeong <daehojeong@google.com>
  */
 #include <stdlib.h>
+#include <stdint.h>
 #include <getopt.h>
 #include <time.h>
 #include <utime.h>
@@ -793,6 +794,13 @@ static inline int erofs_extract_symlink(struct erofs_inode *inode)
 	ret = erofs_verify_inode_data(inode, -1);
 	if (ret)
 		return ret;
+
+	if (inode->i_size > SIZE_MAX - 1) {
+		erofs_err("symlink size %" PRIu64 " is too large @ nid %llu",
+			  inode->i_size, inode->nid | 0ULL);
+		ret = -EOVERFLOW;
+		goto out;
+	}
 
 	buf = malloc(inode->i_size + 1);
 	if (!buf) {
