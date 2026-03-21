@@ -1022,7 +1022,7 @@ static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid)
 		for (i = 0; i < fsckcfg.dirstack.top; ++i)
 			if (inode.nid == fsckcfg.dirstack.dirs[i])
 				return -ELOOP;
-		fsckcfg.dirstack.dirs[fsckcfg.dirstack.top++] = pnid;
+		fsckcfg.dirstack.dirs[fsckcfg.dirstack.top++] = inode.nid;
 		ret = erofs_iterate_dir(&ctx, true);
 		--fsckcfg.dirstack.top;
 	}
