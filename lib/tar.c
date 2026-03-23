@@ -544,7 +544,7 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 			} else if (!strncmp(kv, "size=",
 					sizeof("size=") - 1)) {
 				ret = sscanf(value, "%lld %n", &lln, &n);
-				if(ret < 1 || value[n] != '\0') {
+				if(ret < 1 || value[n] != '\0' || lln < 0) {
 					ret = -EIO;
 					goto out;
 				}
@@ -815,9 +815,11 @@ out_eot:
 		st.st_size = eh.st.st_size;
 	} else {
 		st.st_size = tarerofs_parsenum(th->size, sizeof(th->size));
-		if (errno)
+		if (errno || st.st_size < 0)
 			goto invalid_tar;
 	}
+	if ((u64)st.st_size > (u64)-1 - tar->offset)
+		goto invalid_tar;
 
 	if (th->typeflag <= '7' && !eh.path) {
 		eh.path = path;
@@ -896,17 +898,25 @@ out_eot:
 		goto restart;
 	case 'L':
 		free(eh.path);
+		if (st.st_size > PATH_MAX)
+			goto invalid_tar;
 		eh.path = malloc(st.st_size + 1);
+		if (!eh.path)
+			goto nomem;
 		if (st.st_size != erofs_iostream_bread(&tar->ios, eh.path,
-						       st.st_size))
+						      st.st_size))
 			goto invalid_tar;
 		eh.path[st.st_size] = '\0';
 		goto restart;
 	case 'K':
 		free(eh.link);
+		if (st.st_size > PATH_MAX)
+			goto invalid_tar;
 		eh.link = malloc(st.st_size + 1);
-		if (st.st_size > PATH_MAX || st.st_size !=
-		    erofs_iostream_bread(&tar->ios, eh.link, st.st_size))
+		if (!eh.link)
+			goto nomem;
+		if (st.st_size != erofs_iostream_bread(&tar->ios, eh.link,
+						      st.st_size))
 			goto invalid_tar;
 		eh.link[st.st_size] = '\0';
 		goto restart;
@@ -1156,5 +1166,8 @@ out:
 invalid_tar:
 	erofs_err("invalid tar @ %llu", tar_offset);
 	ret = -EIO;
+	goto out;
+nomem:
+	ret = -ENOMEM;
 	goto out;
 }
