@@ -53,80 +53,99 @@ struct erofs_iostream_liblzma {
 
 void erofs_iostream_close(struct erofs_iostream *ios)
 {
-	free(ios->buffer);
+	if (ios->buffer) {
+		free(ios->buffer);
+		ios->buffer = NULL;
+	}
 	if (ios->decoder == EROFS_IOS_DECODER_GZIP) {
 #if defined(HAVE_ZLIB)
 		gzclose(ios->handler);
 #endif
-		return;
 	} else if (ios->decoder == EROFS_IOS_DECODER_LIBLZMA) {
 #if defined(HAVE_LIBLZMA)
 		lzma_end(&ios->lzma->strm);
 		close(ios->lzma->fd);
 		free(ios->lzma);
 #endif
-		return;
-	} else if (ios->decoder == EROFS_IOS_DECODER_GZRAN) {
-		erofs_gzran_builder_final(ios->gb);
-		return;
+	} else {
+		if (ios->decoder == EROFS_IOS_DECODER_GZRAN)
+			erofs_gzran_builder_final(ios->gb);
+		erofs_io_close(&ios->vf);
 	}
-	erofs_io_close(&ios->vf);
 }
 
 int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder)
 {
 	s64 fsz;
+	int ret;
 
 	ios->feof = false;
 	ios->tail = ios->head = 0;
 	ios->decoder = decoder;
 	ios->dumpfd = -1;
+	ios->buffer = NULL;
+
 	if (decoder == EROFS_IOS_DECODER_GZIP) {
 #if defined(HAVE_ZLIB)
 		ios->handler = gzdopen(fd, "r");
-		if (!ios->handler)
-			return -ENOMEM;
+		if (!ios->handler) {
+			ret = -ENOMEM;
+			goto err_close;
+		}
 		ios->sz = fsz = 0;
 		ios->bufsize = 32768;
 #else
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto err_close;
 #endif
 	} else if (decoder == EROFS_IOS_DECODER_LIBLZMA) {
 #ifdef HAVE_LIBLZMA
-		lzma_ret ret;
+		lzma_ret lret;
 
 		ios->lzma = malloc(sizeof(*ios->lzma));
-		if (!ios->lzma)
-			return -ENOMEM;
+		if (!ios->lzma) {
+			ret = -ENOMEM;
+			goto err_close;
+		}
 		ios->lzma->fd = fd;
 		ios->lzma->strm = (lzma_stream)LZMA_STREAM_INIT;
-		ret = lzma_auto_decoder(&ios->lzma->strm,
+		lret = lzma_auto_decoder(&ios->lzma->strm,
 					UINT64_MAX, LZMA_CONCATENATED);
-		if (ret != LZMA_OK)
-			return -EFAULT;
+		if (lret != LZMA_OK) {
+			free(ios->lzma);
+			ret = -EFAULT;
+			goto err_close;
+		}
 		ios->sz = fsz = 0;
 		ios->bufsize = 32768;
 #else
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto err_close;
 #endif
 	} else if (decoder == EROFS_IOS_DECODER_GZRAN) {
 		ios->vf.fd = fd;
+		ios->vf.ops = NULL;
 		ios->feof = false;
 		ios->sz = 0;
 		ios->bufsize = EROFS_GZRAN_WINSIZE * 2;
 		ios->gb = erofs_gzran_builder_init(&ios->vf, 4194304);
-		if (IS_ERR(ios->gb))
-			return PTR_ERR(ios->gb);
+		if (IS_ERR(ios->gb)) {
+			ret = PTR_ERR(ios->gb);
+			goto err_close;
+		}
 	} else {
 		ios->vf.fd = fd;
+		ios->vf.ops = NULL;
 		fsz = lseek(fd, 0, SEEK_END);
 		if (fsz <= 0) {
 			ios->feof = !fsz;
 			ios->sz = 0;
 		} else {
 			ios->sz = fsz;
-			if (lseek(fd, 0, SEEK_SET))
-				return -EIO;
+			if (lseek(fd, 0, SEEK_SET)) {
+				ret = -EIO;
+				goto err_close;
+			}
 #ifdef HAVE_POSIX_FADVISE
 			if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL))
 				erofs_warn("failed to fadvise: %s, ignored.",
@@ -143,9 +162,16 @@ int erofs_iostream_open(struct erofs_iostream *ios, int fd, int decoder)
 		ios->bufsize >>= 1;
 	} while (ios->bufsize >= 1024);
 
-	if (!ios->buffer)
-		return -ENOMEM;
+	if (!ios->buffer) {
+		ret = -ENOMEM;
+		erofs_iostream_close(ios);
+		return ret;
+	}
 	return 0;
+
+err_close:
+	close(fd);
+	return ret;
 }
 
 int erofs_iostream_read(struct erofs_iostream *ios, void **buf, u64 bytes)
