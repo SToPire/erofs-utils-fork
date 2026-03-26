@@ -1001,7 +1001,7 @@ out_eot:
 			ret = PTR_ERR(d2);
 			goto out;
 		}
-		if (d2->type == EROFS_FT_UNKNOWN) {
+		if (!d2 || d2->type == EROFS_FT_UNKNOWN) {
 			ret = -ENOENT;
 			goto out;
 		}
