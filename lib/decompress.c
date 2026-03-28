@@ -68,11 +68,13 @@ static int z_erofs_decompress_zstd(struct z_erofs_decompress_req *rq)
 	if (ret != (int)total) {
 		erofs_err("ZSTD decompress length mismatch %d, expected %d",
 			  ret, total);
+		ret = -EIO;
 		goto out;
 	}
 	if (rq->decodedskip || total != rq->decodedlength)
 		memcpy(rq->out, dest + rq->decodedskip,
 		       rq->decodedlength - rq->decodedskip);
+	ret = 0;
 out:
 	if (buff)
 		free(buff);
@@ -149,6 +151,7 @@ static qpl_job *z_erofs_qpl_get_job(void)
 		status = qpl_init_job(execution_path, (qpl_job *)job->job);
 		if (status != QPL_STS_OK) {
 			erofs_err("failed to initialize job: %d", status);
+			free(job);
 			return ERR_PTR(-EOPNOTSUPP);
 		}
 		erofs_atomic_dec_return(&z_erofs_qpl_reclaim_quot);
@@ -195,13 +198,17 @@ static int z_erofs_decompress_qpl(struct z_erofs_decompress_req *rq)
 		return PTR_ERR(job);
 
 	inputmargin = z_erofs_fixup_insize(src, rq->inputsize);
-	if (inputmargin >= rq->inputsize)
-		return -EFSCORRUPTED;
+	if (inputmargin >= rq->inputsize) {
+		ret = -EFSCORRUPTED;
+		goto out_inflate_end;
+	}
 
 	if (rq->decodedskip) {
 		buff = malloc(rq->decodedlength);
-		if (!buff)
-			return -ENOMEM;
+		if (!buff) {
+			ret = -ENOMEM;
+			goto out_inflate_end;
+		}
 		dest = buff;
 	}
 

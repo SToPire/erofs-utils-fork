@@ -64,6 +64,7 @@ static struct erofsmount_cfg {
 	long flags;
 	enum erofs_backend_drv backend;
 	enum erofsmount_mode mountmode;
+	bool force_loopdev;
 } mountcfg = {
 	.full_options = "ro",
 	.flags = MS_RDONLY,		/* default mountflags */
@@ -203,15 +204,15 @@ static long erofsmount_parse_flagopts(char *s, long flags, char **more)
 	} opts[] = {
 		{"defaults", 0}, {"quiet", 0}, // NOPs
 		{"user", 0}, {"nouser", 0}, // checked in fstab, ignored in -o
-		{"ro", MS_RDONLY}, {"rw", ~MS_RDONLY},
-		{"nosuid", MS_NOSUID}, {"suid", ~MS_NOSUID},
-		{"nodev", MS_NODEV}, {"dev", ~MS_NODEV},
-		{"noexec", MS_NOEXEC}, {"exec", ~MS_NOEXEC},
-		{"sync", MS_SYNCHRONOUS}, {"async", ~MS_SYNCHRONOUS},
-		{"noatime", MS_NOATIME}, {"atime", ~MS_NOATIME},
-		{"norelatime", ~MS_RELATIME}, {"relatime", MS_RELATIME},
-		{"nodiratime", MS_NODIRATIME}, {"diratime", ~MS_NODIRATIME},
-		{"loud", ~MS_SILENT},
+		{"ro", MS_RDONLY}, {"rw", ~(long)MS_RDONLY},
+		{"nosuid", MS_NOSUID}, {"suid", ~(long)MS_NOSUID},
+		{"nodev", MS_NODEV}, {"dev", ~(long)MS_NODEV},
+		{"noexec", MS_NOEXEC}, {"exec", ~(long)MS_NOEXEC},
+		{"sync", MS_SYNCHRONOUS}, {"async", ~(long)MS_SYNCHRONOUS},
+		{"noatime", MS_NOATIME}, {"atime", ~(long)MS_NOATIME},
+		{"norelatime", ~(long)MS_RELATIME}, {"relatime", MS_RELATIME},
+		{"nodiratime", MS_NODIRATIME}, {"diratime", ~(long)MS_NODIRATIME},
+		{"loud", ~(long)MS_SILENT},
 		{"remount", MS_REMOUNT}, {"move", MS_MOVE},
 		// mand dirsync rec iversion strictatime
 	};
@@ -225,7 +226,9 @@ static long erofsmount_parse_flagopts(char *s, long flags, char **more)
 		if (comma)
 			*comma = '\0';
 
-		if (strncmp(s, "oci", 3) == 0) {
+		if (!strcmp(s, "loop")) {
+			mountcfg.force_loopdev = true;
+		} else if (strncmp(s, "oci", 3) == 0) {
 			/* Initialize ocicfg here iff != EROFSNBD_SOURCE_OCI */
 			if (nbdsrc.type != EROFSNBD_SOURCE_OCI) {
 				erofs_warn("EXPERIMENTAL OCI mount support in use, use at your own risk.");
@@ -281,6 +284,7 @@ static int erofsmount_parse_options(int argc, char **argv)
 		{0, 0, 0, 0},
 	};
 	char *dot;
+	long ret;
 	int opt;
 	int i;
 
@@ -305,9 +309,11 @@ static int erofsmount_parse_options(int argc, char **argv)
 			break;
 		case 'o':
 			mountcfg.full_options = optarg;
-			mountcfg.flags =
-				erofsmount_parse_flagopts(optarg, mountcfg.flags,
-							  &mountcfg.options);
+			ret = erofsmount_parse_flagopts(optarg, mountcfg.flags,
+							&mountcfg.options);
+			if (ret < 0)
+				return (int)ret;
+			mountcfg.flags = ret;
 			break;
 		case 't':
 			dot = strchr(optarg, '.');
@@ -717,6 +723,7 @@ out_closefd:
 static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *source)
 {
 	char *b64cred = NULL;
+	const char *platform;
 	int ret;
 
 	if (source->ocicfg.username || source->ocicfg.password) {
@@ -726,11 +733,15 @@ static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *sourc
 			return PTR_ERR(b64cred);
 	}
 
+	platform = source->ocicfg.platform;
+	if (!platform || !*platform)
+		platform = ocierofs_get_platform_spec();
+
 	if ((source->ocicfg.tarindex_path || source->ocicfg.zinfo_path) &&
 	    source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "TARINDEX_OCI_BLOB %s %s %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.blob_digest,
 			      b64cred ?: "",
 			      source->ocicfg.tarindex_path ?: "",
@@ -742,7 +753,7 @@ static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *sourc
 	if (source->ocicfg.blob_digest && *source->ocicfg.blob_digest) {
 		ret = fprintf(f, "OCI_NATIVE_BLOB %s %s %s %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.blob_digest,
 			      b64cred ?: "");
 		free(b64cred);
@@ -752,7 +763,7 @@ static int erofsmount_write_recovery_oci(FILE *f, struct erofs_nbd_source *sourc
 	if (source->ocicfg.layer_index >= 0) {
 		ret = fprintf(f, "OCI_LAYER %s %s %d %s\n",
 			      source->ocicfg.image_ref ?: "",
-			      source->ocicfg.platform ?: "",
+			      platform ?: "",
 			      source->ocicfg.layer_index,
 			      b64cred ?: "");
 		free(b64cred);
@@ -1522,6 +1533,9 @@ int main(int argc, char *argv[])
 		goto exit;
 	}
 
+	if (mountcfg.force_loopdev)
+		goto loopmount;
+
 	err = mount(mountcfg.device, mountcfg.target, mountcfg.fstype,
 		    mountcfg.flags, mountcfg.options);
 	if (err < 0)
@@ -1531,6 +1545,7 @@ int main(int argc, char *argv[])
 		err = erofsmount_fuse(mountcfg.device, mountcfg.target,
 				      mountcfg.fstype, mountcfg.full_options);
 	else if (err == -ENOTBLK)
+loopmount:
 		err = erofsmount_loopmount(mountcfg.device, mountcfg.target,
 					   mountcfg.fstype, mountcfg.flags,
 					   mountcfg.options);

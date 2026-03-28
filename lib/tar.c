@@ -11,6 +11,9 @@
 #include "erofs/xattr.h"
 #include "erofs/blobchunk.h"
 #include "erofs/importer.h"
+#if defined(HAVE_SYS_SYSMACROS_H)
+#include <sys/sysmacros.h>
+#endif
 #if defined(HAVE_ZLIB)
 #include <zlib.h>
 #endif
@@ -247,6 +250,7 @@ int erofs_iostream_read(struct erofs_iostream *ios, void **buf, u64 bytes)
 int erofs_iostream_bread(struct erofs_iostream *ios, void *buf, u64 bytes)
 {
 	u64 rem = bytes;
+	u8 *dst = buf;
 	void *src;
 	int ret;
 
@@ -254,7 +258,8 @@ int erofs_iostream_bread(struct erofs_iostream *ios, void *buf, u64 bytes)
 		ret = erofs_iostream_read(ios, &src, rem);
 		if (ret < 0)
 			return ret;
-		memcpy(buf, src, ret);
+		memcpy(dst, src, ret);
+		dst += ret;
 		rem -= ret;
 	} while (rem && ret);
 
@@ -468,7 +473,7 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 	char *buf, *p;
 	int ret;
 
-	buf = malloc(size);
+	buf = malloc((size_t)size + 1);
 	if (!buf)
 		return -ENOMEM;
 	p = buf;
@@ -476,6 +481,7 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 	ret = erofs_iostream_bread(ios, buf, size);
 	if (ret != size)
 		goto out;
+	buf[size] = '\0';
 
 	while (p < buf + size) {
 		char *kv, *key, *value;
@@ -638,8 +644,11 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 
 	for (pos = 0; pos < inode->i_size; pos += ret) {
 		ret = erofs_iostream_read(&tar->ios, &buf, inode->i_size - pos);
-		if (ret < 0)
+		if (ret <= 0) {
+			if (!ret)
+				ret = -EIO;
 			break;
+		}
 		if (erofs_dev_write(sbi, buf,
 				    erofs_pos(sbi, inode->u.i_blkaddr) + pos,
 				    ret)) {
@@ -649,6 +658,8 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 	}
 	inode->idata_size = 0;
 	inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
+	if (ret < 0)
+		return ret;
 	return 0;
 }
 
@@ -671,20 +682,25 @@ static int tarerofs_write_file_data(struct erofs_inode *inode,
 	if (fd < 0)
 		return -EBADF;
 
-	for (j = inode->i_size; j; ) {
+	j = inode->i_size;
+	DBG_BUGON(!j);
+	do {
 		nread = erofs_iostream_read(&tar->ios, &buf, j);
-		if (nread < 0)
+		if (nread <= 0) {
+			if (!nread)
+				nread = -EIO;
 			break;
+		}
 		if (pwrite(fd, buf, nread, off) != nread) {
 			nread = -EIO;
 			break;
 		}
 		j -= nread;
 		off += nread;
-	}
+	} while (j);
 	erofs_diskbuf_commit(inode->i_diskbuf, inode->i_size);
 	inode->datasource = EROFS_INODE_DATA_SOURCE_DISKBUF;
-	return 0;
+	return nread < 0 ? nread : 0;
 }
 
 int tarerofs_parse_tar(struct erofs_importer *im, struct erofs_tarfile *tar)
@@ -855,6 +871,8 @@ out_eot:
 		st.st_mode = S_IFIFO;
 		break;
 	case 'g':
+		if ((u64)st.st_size >= UINT_MAX)
+			goto invalid_tar;
 		ret = tarerofs_parse_pax_header(&tar->ios, &tar->global,
 						st.st_size);
 		if (ret)
@@ -869,6 +887,8 @@ out_eot:
 		}
 		goto restart;
 	case 'x':
+		if ((u64)st.st_size >= UINT_MAX)
+			goto invalid_tar;
 		ret = tarerofs_parse_pax_header(&tar->ios, &eh, st.st_size);
 		if (ret)
 			goto out;
@@ -947,7 +967,7 @@ out_eot:
 			goto out;
 		}
 
-		st.st_rdev = (major << 8) | (minor & 0xff) | ((minor & ~0xff) << 12);
+		st.st_rdev = makedev(major, minor);
 	} else if (th->typeflag == '1' || th->typeflag == '2') {
 		if (!eh.link)
 			eh.link = strndup(th->linkname, sizeof(th->linkname));

@@ -663,7 +663,7 @@ static int mkfs_parse_s3_cfg_passwd(const char *filepath, char *ak, char *sk)
 		erofs_warn("passwd_file %s should not be accessible by group or others",
 			   filepath);
 
-	if (st.st_size > S3_ACCESS_KEY_LEN + S3_SECRET_KEY_LEN + 3) {
+	if (st.st_size >= sizeof(buf)) {
 		erofs_err("passwd_file %s is too large (size: %llu)", filepath,
 			  st.st_size | 0ULL);
 		ret = -EINVAL;
@@ -686,6 +686,12 @@ static int mkfs_parse_s3_cfg_passwd(const char *filepath, char *ak, char *sk)
 		goto err;
 	}
 	*colon = '\0';
+
+	if (strlen(buf) > S3_ACCESS_KEY_LEN ||
+	    strlen(colon + 1) > S3_SECRET_KEY_LEN) {
+		ret = -EINVAL;
+		goto err;
+	}
 
 	strcpy(ak, buf);
 	strcpy(sk, colon + 1);
@@ -1735,7 +1741,9 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 	}
 
 	list_for_each_entry(src, &rebuild_src_list, list) {
+		src->xamgr = g_sbi.xamgr;
 		ret = erofs_rebuild_load_tree(root, src, datamode);
+		src->xamgr = NULL;
 		if (ret) {
 			erofs_err("failed to load %s", src->devname);
 			return ret;
