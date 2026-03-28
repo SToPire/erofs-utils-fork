@@ -122,7 +122,7 @@ images.  Users may prefer smaller images for archiving purposes, even if
 random performance is compromised with those configurations, and even
 worse when using 4KiB blocks.
 
-In order to fulfill users' needs, big plusters has been introduced
+In order to fulfill users' needs, big pclusters has been introduced
 since Linux 5.13, in which each physical clusters will be more than one
 blocks.
 
@@ -159,7 +159,7 @@ write a compress-hints file like below:
 and specify with `--compress-hints=` so that ".so" files will use
 "lz4hc,12" compression with 4k pclusters, ".txt" files will use
 "lzma,9" compression with 32k pclusters, files  under "/sbin" will use
-the default "lzma" compression with 4k plusters and other files will
+the default "lzma" compression with 4k pclusters and other files will
 use "lzma" compression with 16k pclusters.
 
 Note that the largest pcluster size should be specified with the "-C"

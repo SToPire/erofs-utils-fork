@@ -4,6 +4,26 @@ source.
 See the [README](../README) file in the top level directory about
 the brief overview of erofs-utils.
 
+## Quick Start
+
+For those who want a quick build, ensure that the following prerequisites are
+installed (on Debian/Ubuntu):
+
+``` sh
+$ sudo apt-get install autoconf automake libtool pkg-config uuid-dev \
+                       liblz4-dev liblzma-dev libfuse-dev zlib1g-dev \
+                       libselinux1-dev libzstd-dev
+```
+
+Then, run the following commands to build and install:
+
+``` sh
+$ ./autogen.sh
+$ ./configure
+$ make
+# make install
+```
+
 ## Dependencies & build
 
 LZ4 1.9.3+ for LZ4(HC) enabled [^1].
@@ -44,6 +64,18 @@ $ make
 
 Additionally, you could specify liblzma target paths with
 `--with-liblzma-incdir` and `--with-liblzma-libdir` manually.
+
+## How to build with multithreading
+
+To enable multithreading support for mkfs.erofs, use the following:
+
+``` sh
+$ ./configure --enable-multithreading
+$ make
+```
+
+Note that multithreading is enabled by default if the compiler supports it.
+To disable it explicitly, use `--disable-multithreading`.
 
 ## How to build erofsfuse
 
