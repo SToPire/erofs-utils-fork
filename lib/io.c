@@ -551,11 +551,12 @@ ssize_t erofs_io_read(struct erofs_vfile *vf, void *buf, size_t bytes)
 					  strerror(errno));
 				return -errno;
 			}
+			ret = 0;
 		}
 		bytes -= ret;
 		i += ret;
-        }
-        return i;
+	}
+	return i;
 }
 
 ssize_t erofs_io_write(struct erofs_vfile *vf, void *buf, size_t len)
