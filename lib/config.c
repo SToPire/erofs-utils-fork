@@ -100,6 +100,7 @@ int erofs_selabel_open(const char *file_contexts)
 #endif
 
 static bool __erofs_is_progressmsg;
+static pthread_mutex_t erofs_msg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 char *erofs_trim_for_progressinfo(const char *str, int placeholder)
 {
@@ -141,6 +142,7 @@ void erofs_msg(int dbglv, const char *fmt, ...)
 	va_list ap;
 	FILE *f = dbglv >= EROFS_ERR ? stderr : stdout;
 
+	pthread_mutex_lock(&erofs_msg_lock);
 	if (__erofs_is_progressmsg) {
 		fputc('\n', stdout);
 		__erofs_is_progressmsg = false;
@@ -148,6 +150,7 @@ void erofs_msg(int dbglv, const char *fmt, ...)
 	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);
+	pthread_mutex_unlock(&erofs_msg_lock);
 }
 
 void erofs_update_progressinfo(const char *fmt, ...)
@@ -162,14 +165,16 @@ void erofs_update_progressinfo(const char *fmt, ...)
 	vsprintf(msg, fmt, ap);
 	va_end(ap);
 
+	pthread_mutex_lock(&erofs_msg_lock);
 	if (erofs_stdout_tty) {
 		printf("\r\033[K%s", msg);
 		__erofs_is_progressmsg = true;
 		fflush(stdout);
-		return;
+	} else {
+		fputs(msg, stdout);
+		fputc('\n', stdout);
 	}
-	fputs(msg, stdout);
-	fputc('\n', stdout);
+	pthread_mutex_unlock(&erofs_msg_lock);
 }
 
 unsigned int erofs_get_available_processors(void)
