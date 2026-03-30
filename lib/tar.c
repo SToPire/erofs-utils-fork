@@ -839,7 +839,7 @@ out_eot:
 			path[1] = '\0';
 		} else {
 			*_path = '\0';
-			while (path[j - 1] == '/')
+			while (j && path[j - 1] == '/')
 				path[--j] = '\0';
 		}
 	}
