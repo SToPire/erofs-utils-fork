@@ -173,6 +173,14 @@ int erofs_iostream_read(struct erofs_iostream *ios, void **buf, u64 bytes)
 #if defined(HAVE_ZLIB)
 			ret = gzread(ios->handler, ios->buffer + rabytes,
 				     ios->bufsize - rabytes);
+			if (ret < 0) {
+				int errnum;
+				const char *errstr;
+
+				errstr = gzerror(ios->handler, &errnum);
+				erofs_err("failed to gzread: %s", errstr);
+				return -EIO;
+			}
 			if (!ret) {
 				int errnum;
 				const char *errstr;
