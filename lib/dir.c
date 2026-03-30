@@ -172,9 +172,13 @@ int erofs_iterate_dir(struct erofs_dir_context *ctx, bool fsck)
 			return err;
 		}
 
+		if (maxsize < sizeof(struct erofs_dirent)) {
+			erofs_err("too small dir block %llu @ nid %llu, lblk %llu",
+				  maxsize | 0ULL, dir->nid | 0ULL, lblk | 0ULL);
+			return -EFSCORRUPTED;
+		}
 		nameoff = le16_to_cpu(de->nameoff);
-		if (nameoff < sizeof(struct erofs_dirent) ||
-		    nameoff >= erofs_blksiz(sbi)) {
+		if (nameoff < sizeof(struct erofs_dirent) || nameoff >= maxsize) {
 			erofs_err("invalid de[0].nameoff %u @ nid %llu, lblk %llu",
 				  nameoff, dir->nid | 0ULL, lblk | 0ULL);
 			return -EFSCORRUPTED;
