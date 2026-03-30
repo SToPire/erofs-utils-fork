@@ -624,11 +624,28 @@ static int z_erofs_map_blocks_ext(struct erofs_inode *vi,
 
 	if (lstart < lend) {
 		map->m_la = lstart;
-		if (last && (vi->z_advise & Z_EROFS_ADVISE_FRAGMENT_PCLUSTER)) {
-			map->m_flags = EROFS_MAP_FRAGMENT;
+		if (flags & EROFS_GET_BLOCKS_FINDTAIL)
+			vi->z_tailextent_headlcn = lstart >> vi->z_lclusterbits;
+
+		if (last && (vi->z_advise & (Z_EROFS_ADVISE_FRAGMENT_PCLUSTER |
+					    Z_EROFS_ADVISE_INLINE_PCLUSTER))) {
+			if (vi->z_advise & Z_EROFS_ADVISE_INLINE_PCLUSTER) {
+				map->m_flags |= EROFS_MAP_META;
+				map->m_pa = pos + vi->z_extents * recsz;
+				if (recsz <= 4)
+					map->m_pa += 8;
+			} else {
+				map->m_flags = EROFS_MAP_FRAGMENT;
+			}
 			vi->z_fragmentoff = map->m_plen;
 			if (recsz > offsetof(struct z_erofs_extent, pstart_lo))
 				vi->z_fragmentoff |= map->m_pa << 32;
+
+			if (vi->z_advise & Z_EROFS_ADVISE_INLINE_PCLUSTER) {
+				vi->z_fragmentoff = map->m_pa;
+				vi->z_idata_size = map->m_plen &
+						   Z_EROFS_EXTENT_PLEN_MASK;
+			}
 		} else if (map->m_plen & Z_EROFS_EXTENT_PLEN_MASK) {
 			map->m_flags |= EROFS_MAP_MAPPED |
 				EROFS_MAP_FULL_MAPPED | EROFS_MAP_ENCODED;
@@ -683,6 +700,16 @@ static int z_erofs_fill_inode_lazy(struct erofs_inode *vi)
 	    (vi->z_advise & Z_EROFS_ADVISE_EXTENTS)) {
 		vi->z_extents = le32_to_cpu(h->h_extents_lo) |
 			((u64)le16_to_cpu(h->h_extents_hi) << 32);
+		if (vi->z_advise & Z_EROFS_ADVISE_INLINE_PCLUSTER) {
+			struct erofs_map_blocks map = {
+				.buf = __EROFS_BUF_INITIALIZER
+			};
+
+			err = z_erofs_map_blocks_ext(vi, &map,
+						     EROFS_GET_BLOCKS_FINDTAIL);
+			if (err < 0)
+				goto out_put_metabuf;
+		}
 		goto done;
 	}
 	vi->z_algorithmtype[0] = h->h_algorithmtype & 15;

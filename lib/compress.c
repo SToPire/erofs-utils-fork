@@ -1068,10 +1068,16 @@ static void *z_erofs_write_extents(struct z_erofs_compress_ictx *ctx)
 		pstart_hi |= (ei->e.pstart > UINT32_MAX);
 		if ((ei->e.pstart | ei->e.plen) & ((1U << sbi->blkszbits) - 1))
 			unaligned_data = true;
-		if (pend != ei->e.pstart)
+
+		/*
+		 * Inlined extents (ztailpacking) or non-contiguous pclusters
+		 * break physical continuity.
+		 */
+		if (ei->e.inlined || pend != ei->e.pstart)
 			pend = EROFS_NULL_ADDR;
 		else
 			pend += ei->e.plen;
+
 		if (ei->e.length != 1 << lclusterbits) {
 			if (ei->list.next != &ctx->extents ||
 			    ei->e.length > 1 << lclusterbits)
@@ -1149,8 +1155,11 @@ static void *z_erofs_write_indexes(struct z_erofs_compress_ictx *ctx)
 	struct z_erofs_extent_item *ei, *n;
 	void *metabuf;
 
-	/* TODO: support writing encoded extents for ztailpacking later. */
-	if (erofs_sb_has_48bit(sbi) && !inode->idata_size) {
+	/*
+	 * Encoded extents (a.k.a. non-compact indexes) are preferred for
+	 * 48-bit physical addresses or when ztailpacking is used.
+	 */
+	if (erofs_sb_has_48bit(sbi) || inode->idata_size) {
 		metabuf = z_erofs_write_extents(ctx);
 		if (metabuf != ERR_PTR(-EAGAIN)) {
 			if (IS_ERR(metabuf))
