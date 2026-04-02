@@ -2,6 +2,7 @@
 #include "erofs/diskbuf.h"
 #include "erofs/internal.h"
 #include "erofs/print.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -15,6 +16,7 @@ static struct erofs_diskbufstrm {
 	int fd;
 	unsigned int alignsize;
 	bool locked;
+	pthread_mutex_t lock;
 } *dbufstrm;
 
 int erofs_diskbuf_getfd(struct erofs_diskbuf *db, u64 *fpos)
@@ -34,15 +36,20 @@ int erofs_diskbuf_reserve(struct erofs_diskbuf *db, int sid, u64 *off)
 {
 	struct erofs_diskbufstrm *strm = dbufstrm + sid;
 
-	if (strm->tailoffset & (strm->alignsize - 1)) {
-		strm->tailoffset = round_up(strm->tailoffset, strm->alignsize);
+	pthread_mutex_lock(&strm->lock);
+	if (strm->locked) {
+		pthread_mutex_unlock(&strm->lock);
+		return -EBUSY;
 	}
+	if (strm->tailoffset & (strm->alignsize - 1))
+		strm->tailoffset = round_up(strm->tailoffset, strm->alignsize);
 	db->offset = strm->tailoffset;
 	if (off)
 		*off = db->offset + strm->devpos;
 	db->sp = strm;
 	(void)erofs_atomic_inc_return(&strm->count);
-	strm->locked = true;	/* TODO: need a real lock for MT */
+	strm->locked = true;
+	pthread_mutex_unlock(&strm->lock);
 	return strm->fd;
 }
 
@@ -51,9 +58,12 @@ void erofs_diskbuf_commit(struct erofs_diskbuf *db, u64 len)
 	struct erofs_diskbufstrm *strm = db->sp;
 
 	DBG_BUGON(!strm);
+	pthread_mutex_lock(&strm->lock);
 	DBG_BUGON(!strm->locked);
 	DBG_BUGON(strm->tailoffset != db->offset);
 	strm->tailoffset += len;
+	strm->locked = false;
+	pthread_mutex_unlock(&strm->lock);
 }
 
 void erofs_diskbuf_close(struct erofs_diskbuf *db)
@@ -115,6 +125,7 @@ int erofs_diskbuf_init(unsigned int nstrms)
 setupone:
 		strm->tailoffset = 0;
 		erofs_atomic_set(&strm->count, 1);
+		pthread_mutex_init(&strm->lock, NULL);
 		if (fstat(strm->fd, &st))
 			return -errno;
 		strm->alignsize = max_t(u32, st.st_blksize, getpagesize());
@@ -132,6 +143,7 @@ void erofs_diskbuf_exit(void)
 	for (strm = dbufstrm; strm->fd >= 0; ++strm) {
 		DBG_BUGON(erofs_atomic_read(&strm->count) != 1);
 
+		pthread_mutex_destroy(&strm->lock);
 		close(strm->fd);
 		strm->fd = -1;
 	}
