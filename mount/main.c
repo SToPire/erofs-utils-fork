@@ -75,6 +75,7 @@ static struct erofsmount_cfg {
 	char *options;
 	char *full_options;		/* used for erofsfuse */
 	char *fstype;
+	char *worker_log_path;
 	long flags;
 	enum erofs_backend_drv backend;
 	enum erofsmount_mode mountmode;
@@ -119,10 +120,10 @@ static int erofsmount_worker_set_signal(int signum, sighandler_t handler)
 	return 0;
 }
 
-static int erofsmount_worker_detach(void)
+static int erofsmount_worker_detach(const char *log_path)
 {
 	sigset_t mask;
-	int fd, err;
+	int infd, outfd, err;
 
 	if (setsid() < 0)
 		return -errno;
@@ -148,18 +149,33 @@ static int erofsmount_worker_detach(void)
 	if (err)
 		return err;
 
-	fd = open("/dev/null", O_RDWR);
-	if (fd < 0)
+	infd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	if (infd < 0)
 		return -errno;
-	if (dup2(fd, STDIN_FILENO) < 0 || dup2(fd, STDOUT_FILENO) < 0 ||
-	    dup2(fd, STDERR_FILENO) < 0) {
+
+	if (log_path)
+		outfd = open(log_path, O_WRONLY | O_CREAT |
+			     O_APPEND | O_CLOEXEC, 0644);
+	else
+		outfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+	if (outfd < 0) {
 		err = -errno;
-		close(fd);
-		return err;
+		goto infd;
 	}
-	if (fd > STDERR_FILENO)
-		close(fd);
-	return 0;
+	if (dup2(infd, STDIN_FILENO) < 0 || dup2(outfd, STDOUT_FILENO) < 0 ||
+	    dup2(outfd, STDERR_FILENO) < 0) {
+		err = -errno;
+		goto outfd;
+	}
+	err = 0;
+
+outfd:
+	if (outfd > STDERR_FILENO)
+		close(outfd);
+infd:
+	if (infd > STDERR_FILENO)
+		close(infd);
+	return err;
 }
 
 static void erofsmount_worker_exit(int err)
@@ -182,6 +198,11 @@ static void usage(int argc, char **argv)
 		" -u                    unmount the filesystem\n"
 		"    --disconnect       abort an existing NBD device forcibly\n"
 		"    --reattach         reattach to an existing NBD device\n"
+#ifdef EROFS_FANOTIFY_ENABLED
+		"    --worker-log=PATH  redirect nbd/fanotify worker logs to PATH\n"
+#else
+		"    --worker-log=PATH  redirect nbd worker logs to PATH\n"
+#endif
 #ifdef OCIEROFS_ENABLED
 		"\n"
 		"OCI-specific options (EXPERIMENTAL, with -o):\n"
@@ -364,6 +385,7 @@ static int erofsmount_parse_options(int argc, char **argv)
 		{"version", no_argument, 0, 'V'},
 		{"reattach", no_argument, 0, 512},
 		{"disconnect", no_argument, 0, 513},
+		{"worker-log", required_argument, 0, 514},
 		{0, 0, 0, 0},
 	};
 	char *dot;
@@ -430,6 +452,12 @@ static int erofsmount_parse_options(int argc, char **argv)
 			break;
 		case 513:
 			mountcfg.mountmode = EROFSMOUNT_MODE_DISCONNECT;
+			break;
+		case 514:
+			free(mountcfg.worker_log_path);
+			mountcfg.worker_log_path = strdup(optarg);
+			if (!mountcfg.worker_log_path)
+				return -ENOMEM;
 			break;
 		default:
 			return -EINVAL;
@@ -789,7 +817,7 @@ static int erofsmount_startnbd(int nbdfd, struct erofsmount_source *source)
 	}
 	ctx.sk.fd = err;
 
-	err = erofsmount_worker_detach();
+	err = erofsmount_worker_detach(mountcfg.worker_log_path);
 	if (err) {
 		erofs_io_close(&ctx.vd);
 		erofs_io_close(&ctx.sk);
@@ -1176,7 +1204,7 @@ static int erofsmount_startnbd_nl(pid_t *pid, struct erofsmount_source *source)
 		if (err)
 			goto err_sk;
 
-		err = erofsmount_worker_detach();
+		err = erofsmount_worker_detach(mountcfg.worker_log_path);
 		if (err)
 			goto err_sk;
 
@@ -1301,7 +1329,7 @@ static int erofsmount_reattach(const char *target)
 	if (err == 0) {
 		free(line);
 		free(identifier);
-		err = erofsmount_worker_detach();
+		err = erofsmount_worker_detach(mountcfg.worker_log_path);
 		if (!err)
 			err = (int)(uintptr_t)erofsmount_nbd_loopfn(&ctx);
 		erofsmount_worker_exit(err);
@@ -1763,7 +1791,7 @@ static int erofsmount_fanotify_child(struct erofs_fanotify_ctx *ctx,
 	if (err)
 		goto notify;
 
-	err = erofsmount_worker_detach();
+	err = erofsmount_worker_detach(mountcfg.worker_log_path);
 	if (err)
 		goto notify;
 
