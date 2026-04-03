@@ -98,6 +98,75 @@ static struct erofsmount_source {
 	};
 } mountsrc;
 
+static int erofsmount_spawn_worker(pid_t *pid)
+{
+	*pid = fork();
+	if (*pid < 0)
+		return -errno;
+	return *pid;
+}
+
+static int erofsmount_worker_set_signal(int signum, sighandler_t handler)
+{
+	struct sigaction act = {
+		.sa_handler = handler,
+	};
+
+	if (sigemptyset(&act.sa_mask) < 0)
+		return -errno;
+	if (sigaction(signum, &act, NULL) < 0)
+		return -errno;
+	return 0;
+}
+
+static int erofsmount_worker_detach(void)
+{
+	sigset_t mask;
+	int fd, err;
+
+	if (setsid() < 0)
+		return -errno;
+
+	if (sigemptyset(&mask) < 0)
+		return -errno;
+	if (sigprocmask(SIG_SETMASK, &mask, NULL) < 0)
+		return -errno;
+
+	err = erofsmount_worker_set_signal(SIGHUP, SIG_DFL);
+	if (err)
+		return err;
+	err = erofsmount_worker_set_signal(SIGINT, SIG_DFL);
+	if (err)
+		return err;
+	err = erofsmount_worker_set_signal(SIGQUIT, SIG_DFL);
+	if (err)
+		return err;
+	err = erofsmount_worker_set_signal(SIGTERM, SIG_DFL);
+	if (err)
+		return err;
+	err = erofsmount_worker_set_signal(SIGPIPE, SIG_IGN);
+	if (err)
+		return err;
+
+	fd = open("/dev/null", O_RDWR);
+	if (fd < 0)
+		return -errno;
+	if (dup2(fd, STDIN_FILENO) < 0 || dup2(fd, STDOUT_FILENO) < 0 ||
+	    dup2(fd, STDERR_FILENO) < 0) {
+		err = -errno;
+		close(fd);
+		return err;
+	}
+	if (fd > STDERR_FILENO)
+		close(fd);
+	return 0;
+}
+
+static void erofsmount_worker_exit(int err)
+{
+	_exit(err ? EXIT_FAILURE : EXIT_SUCCESS);
+}
+
 static void usage(int argc, char **argv)
 {
 	printf("Usage: %s [OPTIONS] SOURCE [MOUNTPOINT]\n"
@@ -720,6 +789,13 @@ static int erofsmount_startnbd(int nbdfd, struct erofsmount_source *source)
 	}
 	ctx.sk.fd = err;
 
+	err = erofsmount_worker_detach();
+	if (err) {
+		erofs_io_close(&ctx.vd);
+		erofs_io_close(&ctx.sk);
+		goto out_closefd;
+	}
+
 	err = -pthread_create(&th, NULL, erofsmount_nbd_loopfn, &ctx);
 	if (err) {
 		erofs_io_close(&ctx.vd);
@@ -1050,18 +1126,21 @@ static int erofsmount_nbd_fix_backend_linkage(int num, char **recp)
 static int erofsmount_startnbd_nl(pid_t *pid, struct erofsmount_source *source)
 {
 	int pipefd[2], err, num;
+	pid_t ret;
 
 	err = pipe(pipefd);
 	if (err < 0)
 		return -errno;
 
-	if ((*pid = fork()) == 0) {
+	ret = erofsmount_spawn_worker(pid);
+	if (ret < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return ret;
+	}
+	if (ret == 0) {
 		struct erofsmount_nbd_ctx ctx = {};
 		char *recp;
-
-		/* Otherwise, NBD disconnect sends SIGPIPE, skipping cleanup */
-		if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
-			exit(EXIT_FAILURE);
 
 		if (source->type == EROFSMOUNT_SOURCE_OCI) {
 			if (source->ocicfg.tarindex_path || source->ocicfg.zinfo_path) {
@@ -1069,48 +1148,57 @@ static int erofsmount_startnbd_nl(pid_t *pid, struct erofsmount_source *source)
 							       source->ocicfg.tarindex_path,
 							       source->ocicfg.zinfo_path);
 				if (err)
-					exit(EXIT_FAILURE);
+					erofsmount_worker_exit(err);
 			} else {
 				err = ocierofs_io_open(&ctx.vd, &source->ocicfg);
 				if (err)
-					exit(EXIT_FAILURE);
+					erofsmount_worker_exit(err);
 			}
 		} else {
 			err = open(source->device_path, O_RDONLY);
 			if (err < 0)
-				exit(EXIT_FAILURE);
+				erofsmount_worker_exit(-errno);
 			ctx.vd.fd = err;
 		}
 		recp = erofsmount_write_recovery_info(source);
 		if (IS_ERR(recp)) {
 			erofs_io_close(&ctx.vd);
-			exit(EXIT_FAILURE);
+			erofsmount_worker_exit(PTR_ERR(recp));
 		}
 
 		num = -1;
 		err = erofs_nbd_nl_connect(&num, 9, EROFSMOUNT_NBD_DISK_SIZE, recp);
-		if (err >= 0) {
-			ctx.sk.fd = err;
-			err = erofsmount_nbd_fix_backend_linkage(num, &recp);
-			if (err) {
-				erofs_io_close(&ctx.sk);
-			} else {
-				err = write(pipefd[1], &num, sizeof(int));
-				if (err < 0)
-					err = -errno;
-				close(pipefd[1]);
-				close(pipefd[0]);
-				if (err >= sizeof(int)) {
-					err = (int)(uintptr_t)erofsmount_nbd_loopfn(&ctx);
-					goto out_fork;
-				}
-			}
+		if (err < 0)
+			goto err_vd;
+
+		ctx.sk.fd = err;
+		err = erofsmount_nbd_fix_backend_linkage(num, &recp);
+		if (err)
+			goto err_sk;
+
+		err = erofsmount_worker_detach();
+		if (err)
+			goto err_sk;
+
+		err = write(pipefd[1], &num, sizeof(int));
+		if (err < 0)
+			err = -errno;
+		close(pipefd[1]);
+		close(pipefd[0]);
+		if (err >= (int)sizeof(int)) {
+			err = (int)(uintptr_t)erofsmount_nbd_loopfn(&ctx);
+			goto out_fork;
 		}
+		goto err_sk;
+
+err_sk:
+		erofs_io_close(&ctx.sk);
+err_vd:
 		erofs_io_close(&ctx.vd);
 out_fork:
 		(void)unlink(recp);
 		free(recp);
-		exit(err ? EXIT_FAILURE : EXIT_SUCCESS);
+		erofsmount_worker_exit(err);
 	}
 	close(pipefd[1]);
 	err = read(pipefd[0], &num, sizeof(int));
@@ -1122,11 +1210,12 @@ out_fork:
 
 static int erofsmount_reattach(const char *target)
 {
-	char *identifier, *line, *source, *recp = NULL;
+	char *identifier, *line = NULL, *source, *recp = NULL;
 	struct erofsmount_nbd_ctx ctx = {};
+	pid_t pid;
 	int nbdnum, err;
 	struct stat st;
-	size_t n;
+	size_t n = 0;
 	FILE *f;
 
 	err = lstat(target, &st);
@@ -1154,18 +1243,16 @@ static int erofsmount_reattach(const char *target)
 	}
 
 	f = fopen(identifier ?: recp, "r");
-	if (!f) {
-		err = -errno;
-		free(recp);
-		goto err_identifier;
-	}
 	free(recp);
 
-	line = NULL;
+	if (!f) {
+		err = -errno;
+		goto err_identifier;
+	}
 	if ((err = getline(&line, &n, f)) <= 0) {
 		err = -errno;
 		fclose(f);
-		goto err_identifier;
+		goto err_line;
 	}
 	fclose(f);
 	if (err && line[err - 1] == '\n')
@@ -1202,18 +1289,27 @@ static int erofsmount_reattach(const char *target)
 	}
 
 	err = erofs_nbd_nl_reconnect(nbdnum, identifier);
-	if (err >= 0) {
-		ctx.sk.fd = err;
-		if (fork() == 0) {
-			free(line);
-			free(identifier);
-			if ((uintptr_t)erofsmount_nbd_loopfn(&ctx))
-				return EXIT_FAILURE;
-			return EXIT_SUCCESS;
-		}
+	if (err < 0)
+		goto err_vd;
+	ctx.sk.fd = err;
+
+	err = erofsmount_spawn_worker(&pid);
+	if (err < 0) {
 		erofs_io_close(&ctx.sk);
-		err = 0;
+		goto err_vd;
 	}
+	if (err == 0) {
+		free(line);
+		free(identifier);
+		err = erofsmount_worker_detach();
+		if (!err)
+			err = (int)(uintptr_t)erofsmount_nbd_loopfn(&ctx);
+		erofsmount_worker_exit(err);
+	}
+	erofs_io_close(&ctx.sk);
+
+	err = 0;
+err_vd:
 	erofs_io_close(&ctx.vd);
 err_line:
 	free(line);
@@ -1251,9 +1347,15 @@ static int erofsmount_nbd(struct erofsmount_source *source,
 		if (nbdfd < 0)
 			return -errno;
 
-		if ((pid = fork()) == 0)
-			return erofsmount_startnbd(nbdfd, source) ?
-				EXIT_FAILURE : EXIT_SUCCESS;
+		err = erofsmount_spawn_worker(&pid);
+		if (err < 0) {
+			close(nbdfd);
+			return err;
+		}
+		if (err == 0) {
+			err = erofsmount_startnbd(nbdfd, source);
+			erofsmount_worker_exit(err);
+		}
 	} else {
 		num = err;
 		(void)snprintf(nbdpath, sizeof(nbdpath), "/dev/nbd%d", num);
@@ -1661,6 +1763,10 @@ static int erofsmount_fanotify_child(struct erofs_fanotify_ctx *ctx,
 	if (err)
 		goto notify;
 
+	err = erofsmount_worker_detach();
+	if (err)
+		goto notify;
+
 	err = 0;
 notify:
 	write(pipefd, &err, sizeof(err));
@@ -1730,19 +1836,17 @@ static int erofsmount_fanotify(struct erofsmount_source *source,
 		goto out;
 	}
 
-	pid = fork();
-	if (pid < 0) {
-		err = -errno;
+	err = erofsmount_spawn_worker(&pid);
+	if (err < 0) {
 		close(pipefd[0]);
 		close(pipefd[1]);
 		goto out;
 	}
-
-	if (pid == 0) {
+	if (err == 0) {
 		close(pipefd[0]);
 		err = erofsmount_fanotify_child(&ctx, pipefd[1]);
 		erofsmount_fanotify_ctx_cleanup(&ctx);
-		exit(err ? EXIT_FAILURE : EXIT_SUCCESS);
+		erofsmount_worker_exit(err);
 	}
 
 	/* Wait for child to report fanotify initialization result */
