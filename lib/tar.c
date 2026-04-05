@@ -320,17 +320,26 @@ static long long tarerofs_otoi(const char *ptr, int len)
 
 static long long tarerofs_parsenum(const char *ptr, int len)
 {
+	const u8 *p = (const u8 *)ptr;
+
 	errno = 0;
 	/*
 	 * For fields containing numbers or timestamps that are out of range
 	 * for the basic format, the GNU format uses a base-256 representation
 	 * instead of an ASCII octal number.
 	 */
-	if (*(char *)ptr == '\200' || *(char *)ptr == '\377') {
-		long long res = 0;
+	if (*(char *)ptr == '\200') {
+		unsigned long long res = 0;
 
 		while (--len)
-			res = (res << 8) | (u8)*(++ptr);
+			res = (res << 8) | *(++p);
+		return res;
+	}
+	if (*(char *)ptr == '\377') {
+		unsigned long long res = -1ULL;
+
+		while (len--)
+			res = (res << 8) | *(p++);
 		return res;
 	}
 	return tarerofs_otoi(ptr, len);
