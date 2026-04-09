@@ -396,6 +396,11 @@ int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices)
 	sbi->bh_devt = bh;
 	sbi->devt_slotoff = erofs_btell(bh, false) / EROFS_DEVT_SLOT_SIZE;
 	sbi->extra_devices = devices;
+	
+	/* Initialize uniaddr for block map with blobdev support */
+	if (devices > 0)
+		sbi->devs[0].uniaddr = sbi->primarydevice_blocks;
+	
 	erofs_sb_set_device_table(sbi);
 	return 0;
 }

@@ -1571,11 +1571,14 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		return -EINVAL;
 	}
 
-	/* TODO: can be implemented with (deviceslot) mapped_blkaddr */
+	/* Blobdev with block map uses deviceslot unified addressing */
 	if (cfg.c_blobdev_path &&
 	    cfg.c_force_chunkformat == FORCE_INODE_BLOCK_MAP) {
-		erofs_err("--blobdev cannot work with block map currently");
-		return -EINVAL;
+		/* Block map format can work with blobdev using unified addressing */
+		if (!g_sbi.extra_devices) {
+			erofs_err("--blobdev requires device table setup");
+			return -EINVAL;
+		}
 	}
 
 	if (optind >= argc) {

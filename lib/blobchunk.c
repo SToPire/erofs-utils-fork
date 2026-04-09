@@ -95,7 +95,14 @@ static struct erofs_blobchunk *erofs_blob_getchunk(struct erofs_sb_info *sbi,
 		chunk->device_id = 1;
 	else
 		chunk->device_id = 0;
-	chunk->blkaddr = erofs_blknr(sbi, blkpos);
+	
+	/* For block map with blobdev, use unified addressing */
+	if (sbi->extra_devices && cfg.c_force_chunkformat == FORCE_INODE_BLOCK_MAP) {
+		chunk->blkaddr = sbi->devs[0].uniaddr + erofs_blknr(sbi, blkpos);
+		chunk->device_id = 0;  /* unified address space */
+	} else {
+		chunk->blkaddr = erofs_blknr(sbi, blkpos);
+	}
 
 	erofs_dbg("Writing chunk (%llu bytes) to %llu", chunksize | 0ULL,
 		  chunk->blkaddr | 0ULL);
@@ -324,7 +331,7 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 	chunksize = 1ULL << chunkbits;
 	count = DIV_ROUND_UP(inode->i_size, chunksize);
 
-	if (sbi->extra_devices)
+	if (sbi->extra_devices && cfg.c_force_chunkformat != FORCE_INODE_BLOCK_MAP)
 		inode->u.chunkformat |= EROFS_CHUNK_FORMAT_INDEXES;
 	if (inode->u.chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
 		unit = sizeof(struct erofs_inode_chunk_index);
@@ -498,6 +505,14 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 		unit = sizeof(struct erofs_inode_chunk_index);
 		DBG_BUGON(erofs_blkoff(sbi, data_offset));
 		blkaddr = erofs_blknr(sbi, data_offset);
+	} else if (cfg.c_blobdev_path && 
+		   cfg.c_force_chunkformat == FORCE_INODE_BLOCK_MAP) {
+		/* Block map with blobdev: use unified addressing via deviceslot */
+		device_id = 0;  /* unified address space, no device_id needed */
+		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;
+		DBG_BUGON(erofs_blkoff(sbi, data_offset));
+		/* Map to unified address space using device's uniaddr base */
+		blkaddr = sbi->devs[0].uniaddr + erofs_blknr(sbi, data_offset);
 	} else {
 		device_id = 0;
 		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;
