@@ -667,12 +667,12 @@ int erofs_io_xcopy(struct erofs_vfile *vout, off_t pos,
 		ret = erofs_io_read(vin, buf, ret);
 		if (ret < 0)
 			return ret;
-		if (ret > 0) {
-			ret = erofs_io_pwrite(vout, buf, pos, ret);
-			if (ret < 0)
-				return ret;
-			pos += ret;
-		}
+		if (!ret)
+			return -EIO;
+		ret = erofs_io_pwrite(vout, buf, pos, ret);
+		if (ret < 0)
+			return ret;
+		pos += ret;
 		len -= ret;
 	} while (len);
 	return 0;
