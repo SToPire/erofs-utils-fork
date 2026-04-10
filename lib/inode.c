@@ -1975,6 +1975,13 @@ static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
 
 	if (!ishare_xattr_prefix_id)
 		return 0;
+
+	if (inode->datasource == EROFS_INODE_DATA_SOURCE_NONE) {
+		ret = erofs_iopen(&vf, inode);
+		if (ret)
+			return ret;
+	}
+
 	erofs_sha256_init(&md);
 	do {
 		u8 buf[32768];
@@ -2018,12 +2025,6 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 			goto out;
 		}
 
-		if (S_ISREG(inode->i_mode) && inode->i_size) {
-			ret = erofs_set_inode_fingerprint(inode, ctx.fd, ctx.fpos);
-			if (ret < 0)
-				return ret;
-		}
-
 		if (inode->sbi->available_compr_algs &&
 		    erofs_file_is_compressible(im, inode)) {
 			ctx.ictx = erofs_prepare_compressed_file(im, inode);
@@ -2037,6 +2038,13 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 		}
 	}
 out:
+	if (S_ISREG(inode->i_mode) && inode->i_size &&
+	    inode->datasource != EROFS_INODE_DATA_SOURCE_RESVSP) {
+		ret = erofs_set_inode_fingerprint(inode, ctx.fd, ctx.fpos);
+		if (ret < 0)
+			return ret;
+	}
+
 	return erofs_mkfs_go(btctx, EROFS_MKFS_JOB_NDIR, &ctx, sizeof(ctx));
 }
 
