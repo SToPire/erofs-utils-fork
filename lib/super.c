@@ -50,7 +50,7 @@ static int erofs_init_devices(struct erofs_sb_info *sbi,
 		return 0;
 
 	sbi->extra_devices = ondisk_extradevs;
-	sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
+	sbi->device_id_mask = roundup_pow_of_two((u64)ondisk_extradevs + 1) - 1;
 	sbi->devs = calloc(ondisk_extradevs, sizeof(*sbi->devs));
 	if (!sbi->devs)
 		return -ENOMEM;
