@@ -2002,6 +2002,8 @@ static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
 				     min_t(u64, remaining, sizeof(buf)), pos);
 		if (ret < 0)
 			return ret;
+		if (!ret)
+			return -EIO;
 		if (ret > 0)
 			erofs_sha256_process(&md, buf, ret);
 		remaining -= ret;
