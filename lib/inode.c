@@ -1574,9 +1574,10 @@ static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 	}
 	if (ret)
 		return ret;
-	erofs_prepare_inode_buffer(btctx->im, inode);
-	erofs_write_tail_end(btctx->im, inode);
-	return 0;
+	ret = erofs_prepare_inode_buffer(btctx->im, inode);
+	if (ret)
+		return ret;
+	return erofs_write_tail_end(btctx->im, inode);
 }
 
 static int erofs_mkfs_create_directory(const struct erofs_mkfs_btctx *ctx,
@@ -1650,7 +1651,9 @@ static int erofs_mkfs_jobfn(const struct erofs_mkfs_btctx *ctx,
 		ret = erofs_write_dir_file(ctx->im, inode);
 		if (ret)
 			return ret;
-		erofs_write_tail_end(ctx->im, inode);
+		ret = erofs_write_tail_end(ctx->im, inode);
+		if (ret)
+			return ret;
 		inode->bh->op = &erofs_write_inode_bhops;
 		erofs_iput(inode);
 		return 0;
@@ -2406,8 +2409,12 @@ struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_importer *im,
 	if (ret)
 		return ERR_PTR(ret);
 out:
-	erofs_prepare_inode_buffer(im, inode);
-	erofs_write_tail_end(im, inode);
+	ret = erofs_prepare_inode_buffer(im, inode);
+	if (ret)
+		return ERR_PTR(ret);
+	ret = erofs_write_tail_end(im, inode);
+	if (ret)
+		return ERR_PTR(ret);
 	return inode;
 }
 
