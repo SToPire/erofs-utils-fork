@@ -123,8 +123,10 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 			d = erofs_d_lookup(pwd, s);
 			if (d) {
 				if (d->type != EROFS_FT_DIR) {
-					if (slash)
+					if (slash) {
+						*slash = '/';
 						return ERR_PTR(-ENOTDIR);
+					}
 				} else if (to_head) {
 					list_del(&d->d_child);
 					list_add(&d->d_child, &pwd->i_subdirs);
@@ -132,8 +134,10 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 				pwd = d->inode;
 			} else if (slash) {
 				d = erofs_rebuild_mkdir(pwd, s);
-				if (IS_ERR(d))
+				if (IS_ERR(d)) {
+					*slash = '/';
 					return d;
+				}
 			} else {
 				d = erofs_d_alloc(pwd, s);
 				if (IS_ERR(d))
