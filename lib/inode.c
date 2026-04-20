@@ -1562,6 +1562,10 @@ static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 				free(symlink);
 				return -errno;
 			}
+			if (ret != inode->i_size) {
+				free(symlink);
+				return -EIO;
+			}
 		}
 		ret = erofs_write_file_from_buffer(inode, symlink);
 		free(symlink);
