@@ -1223,19 +1223,35 @@ void z_erofs_drop_inline_pcluster(struct erofs_inode *inode)
 
 		di->di_advise = cpu_to_le16(type);
 	} else if (inode->datalayout == EROFS_INODE_COMPRESSED_COMPACT) {
-		/* handle the last compacted 4B pack */
+		/* handle the last compacted pack */
 		unsigned int eofs, base, pos, v, lo;
 		u8 *out;
+		unsigned int compacted_4b_initial, compacted_2b, compacted_4b_end;
+		unsigned int totalidx = BLK_ROUND_UP(sbi, inode->i_size);
+		const erofs_off_t ebase = sizeof(struct z_erofs_map_header) +
+			round_up(erofs_iloc(inode) + inode->inode_isize +
+					inode->xattr_isize, 8);
 
-		eofs = inode->extent_isize -
-			(4 << (BLK_ROUND_UP(sbi, inode->i_size) & 1));
-		base = round_down(eofs, 8);
-		pos = 16 /* encodebits */ * ((eofs - base) / 4);
-		out = inode->compressmeta + base;
-		lo = erofs_blkoff(sbi, get_unaligned_le32(out + pos / 8));
-		v = (type << sbi->blkszbits) | lo;
-		out[pos / 8] = v & 0xff;
-		out[pos / 8 + 1] = v >> 8;
+		compacted_4b_initial = ((32 - ebase % 32) / 4) & 7;
+		compacted_2b = 0;
+		if ((le16_to_cpu(h->h_advise) & Z_EROFS_ADVISE_COMPACTED_2B) &&
+			compacted_4b_initial < totalidx)
+			compacted_2b = rounddown(totalidx - compacted_4b_initial, 16);
+		compacted_4b_end = totalidx - compacted_4b_initial - compacted_2b;
+		if (!compacted_2b || compacted_4b_end) {
+			eofs = inode->extent_isize - (4 << (totalidx & 1));
+			base = round_down(eofs, 8);
+			pos = 16 /* encodebits */ * ((eofs - base) / 4);
+			out = inode->compressmeta + base;
+			lo = erofs_blkoff(sbi, get_unaligned_le32(out + pos / 8));
+			v = (type << sbi->blkszbits) | lo;
+			out[pos / 8] = v & 0xff;
+			out[pos / 8 + 1] = v >> 8;
+		} else {
+			eofs = inode->extent_isize - (4 + 1);
+			out = inode->compressmeta + eofs;
+			*out = (*out & 0x3f) | (type << 6);
+		}
 	} else {
 		DBG_BUGON(1);
 		return;
