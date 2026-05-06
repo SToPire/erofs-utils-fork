@@ -24,6 +24,7 @@
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
 #include "erofs/blobchunk.h"
+#include "erofs/hotfile.h"
 #include "erofs/importer.h"
 #include "liberofs_cache.h"
 #include "liberofs_compress.h"
@@ -661,10 +662,20 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 	inode->idata_size = inode->i_size % erofs_blksiz(sbi);
 	remaining = inode->i_size - inode->idata_size;
 
-	ret = erofs_allocate_inode_bh_data(inode, remaining >> sbi->blkszbits,
-					   in_metazone);
-	if (ret)
-		return ret;
+	/*
+	 * Hot directories may have their main data block pre-allocated
+	 * during hot-queue processing so that its physical offset is
+	 * placed inside the hot region. Reuse it rather than re-balloc,
+	 * which would leak the pre-allocated buffer and defeat the
+	 * layout intent.
+	 */
+	if (!inode->bh_data) {
+		ret = erofs_allocate_inode_bh_data(inode,
+						   remaining >> sbi->blkszbits,
+						   in_metazone);
+		if (ret)
+			return ret;
+	}
 
 	bh = inode->bh_data;
 	if (bh) {
@@ -1008,7 +1019,8 @@ static int erofs_prepare_inode_buffer(struct erofs_importer *im,
 		goto noinline;
 
 	if (!is_inode_layout_compression(inode)) {
-		if (params->no_datainline && S_ISREG(inode->i_mode)) {
+		if (S_ISREG(inode->i_mode) &&
+		    (params->no_datainline || erofs_inode_is_hotfile(inode))) {
 			inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 			goto noinline;
 		}
@@ -1351,6 +1363,15 @@ static int erofs_fill_inode(struct erofs_importer *im, struct erofs_inode *inode
 		if (!inode->i_srcpath)
 			return -ENOMEM;
 	}
+	inode->hot_rank = EROFS_HOT_RANK_NONE;
+	if (!erofs_is_special_identifier(path)) {
+		inode->hot_rank = erofs_get_hot_file_rank(path);
+		inode->hotfile = inode->hot_rank != EROFS_HOT_RANK_NONE;
+		if (!inode->hotfile && S_ISDIR(st->st_mode)) {
+			inode->hot_rank = erofs_get_hot_dir_rank(path);
+			inode->hotdir = inode->hot_rank != EROFS_HOT_RANK_NONE;
+		}
+	}
 
 	if (erofs_should_use_inode_extended(im, inode, path)) {
 		if (params->force_inodeversion == EROFS_FORCE_INODE_COMPACT) {
@@ -1410,11 +1431,28 @@ static struct erofs_inode *erofs_iget_from_local(struct erofs_importer *im,
 	 * lookup in hash table first, if it already exists we have a
 	 * hard-link, just return it. Also don't lookup for directories
 	 * since hard-link directory isn't allowed.
+	 *
+	 * When a hard-linked inode has already been created via another
+	 * name, only that first name's hotfile rank was recorded. If the
+	 * current name is listed in the hotlist with a lower rank (= hotter
+	 * priority), adopt it so the shared inode gets the hottest rank
+	 * across all of its hard-links. Without this, an inode shared by
+	 * cold + hot paths (e.g. /usr/share/zoneinfo/Asia/Chongqing shared
+	 * with .../Shanghai, only Shanghai is hot) ends up with no hot rank
+	 * and gets placed in the cold region, blowing up the hot-zone end
+	 * to near the full image size.
 	 */
 	if (!S_ISDIR(st.st_mode) && !params->hard_dereference) {
 		inode = erofs_iget(st.st_dev, st.st_ino);
-		if (inode)
+		if (inode) {
+			u32 rank = erofs_get_hot_file_rank(path);
+
+			if (rank != EROFS_HOT_RANK_NONE && rank < inode->hot_rank) {
+				inode->hot_rank = rank;
+				inode->hotfile = true;
+			}
 			return inode;
+		}
 	}
 
 	/* cannot find in the inode cache */
@@ -1612,6 +1650,42 @@ static int erofs_mkfs_create_directory(const struct erofs_mkfs_btctx *ctx,
 	if (ret)
 		return ret;
 	inode->bh->op = &erofs_skip_write_bhops;
+
+	/*
+	 * For hot directories, also pre-allocate the main dentry data
+	 * block right now (while we are still in the hot-queue stage),
+	 * so that its physical offset falls inside the hot region.
+	 * Otherwise the main dentry block would be ballocated lazily by
+	 * erofs_write_unencoded_data() during the later cold-dir dump
+	 * pass, landing well past the hot prefix and breaking path
+	 * lookups such as /usr/bin/sh when the image is head-truncated
+	 * to the hot prefix.
+	 *
+	 * A directory is treated as hot here when it has any hot rank,
+	 * either because it was listed as a hot dir (trailing slash) or
+	 * because a caller accidentally listed it as a hot file (no
+	 * trailing slash). In both cases the user signalled that the
+	 * lookup path passes through this directory, so its dentry
+	 * block must be reachable from the hot prefix.
+	 *
+	 * Only uncompressed FLAT_{INLINE,PLAIN} dirs have a separate
+	 * main data extent; compressed dirs carry all bytes via the
+	 * compression path and do not go through erofs_balloc(DIRA).
+	 */
+	if ((inode->hotdir || inode->hotfile) &&
+	    inode->hot_rank != EROFS_HOT_RANK_NONE &&
+	    (inode->datalayout == EROFS_INODE_FLAT_INLINE ||
+	     inode->datalayout == EROFS_INODE_FLAT_PLAIN)) {
+		u64 remaining = inode->i_size - inode->idata_size;
+
+		if (remaining) {
+			ret = erofs_allocate_inode_bh_data(inode,
+					remaining >> inode->sbi->blkszbits,
+					ctx->im->params->dirdata_in_metazone);
+			if (ret)
+				return ret;
+		}
+	}
 	return 0;
 }
 
@@ -2129,18 +2203,176 @@ static void erofs_mark_parent_inode(struct erofs_inode *inode,
 	inode->i_parent = (void *)((unsigned long)dir | 1);
 }
 
+struct erofs_mkfs_hot_item {
+	struct erofs_mkfs_hot_item *next;
+	struct erofs_inode *parent;
+	struct erofs_inode *inode;
+	unsigned int priority;
+	unsigned int rank;
+	unsigned int order;
+};
+
+static unsigned int erofs_mkfs_inode_rank(struct erofs_inode *inode)
+{
+	/*
+	 * A directory that the user listed without a trailing slash
+	 * ends up with hotfile=true/hotdir=false but still carries a
+	 * valid hot_rank. Treat it as a hot directory here so its
+	 * metadata (including the pre-allocated dentry data block)
+	 * participates in the hot-queue layout. Otherwise the dentry
+	 * block is emitted during the later cold-dir pass and falls
+	 * outside the hot prefix.
+	 */
+	if ((!S_ISDIR(inode->i_mode) && erofs_inode_is_hotfile(inode)) ||
+	    (S_ISDIR(inode->i_mode) &&
+	     (inode->hotdir || inode->hotfile)))
+		return inode->hot_rank;
+	return EROFS_HOT_RANK_NONE;
+}
+
+static unsigned int erofs_mkfs_hot_item_priority(struct erofs_inode *inode)
+{
+	/* Path lookup needs hot directory and symlink metadata before file data. */
+	if (S_ISDIR(inode->i_mode) || S_ISLNK(inode->i_mode))
+		return 0;
+	return 1;
+}
+
+static int erofs_mkfs_enqueue_hot_item(struct erofs_mkfs_hot_item **queue,
+				       struct erofs_inode *parent,
+				       struct erofs_inode *inode,
+				       unsigned int *order)
+{
+	struct erofs_mkfs_hot_item *item, **pos = queue;
+
+	item = malloc(sizeof(*item));
+	if (!item)
+		return -ENOMEM;
+
+	item->parent = parent;
+	item->inode = inode;
+	item->priority = erofs_mkfs_hot_item_priority(inode);
+	item->rank = erofs_mkfs_inode_rank(inode);
+	item->order = (*order)++;
+	item->next = NULL;
+
+	while (*pos) {
+		if (item->priority < (*pos)->priority)
+			break;
+		if (item->priority > (*pos)->priority) {
+			pos = &(*pos)->next;
+			continue;
+		}
+		if (item->rank < (*pos)->rank)
+			break;
+		if (item->rank == (*pos)->rank &&
+		    item->order < (*pos)->order)
+			break;
+		pos = &(*pos)->next;
+	}
+	item->next = *pos;
+	*pos = item;
+	return 0;
+}
+
+static int erofs_mkfs_enqueue_hot_children(struct erofs_inode *dir,
+					   struct erofs_mkfs_hot_item **queue,
+					   unsigned int *order)
+{
+	struct erofs_dentry *d;
+
+	list_for_each_entry(d, &dir->i_subdirs, d_child) {
+		struct erofs_inode *inode = d->inode;
+		int err;
+
+		if (is_dot_dotdot(d->name) ||
+		    (d->flags & EROFS_DENTRY_FLAG_VALIDNID))
+			continue;
+		if (erofs_mkfs_inode_rank(inode) == EROFS_HOT_RANK_NONE)
+			continue;
+		err = erofs_mkfs_enqueue_hot_item(queue, dir, inode, order);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int erofs_mkfs_dump_tree_default(const struct erofs_mkfs_btctx *ctx,
+					struct erofs_inode *dumpdir,
+					struct list_head *pending_dirs,
+					bool grouped_dirdata)
+{
+	int err = 0, err2;
+
+	do {
+		struct erofs_inode *dir = dumpdir;
+		/* used for adding sub-directories in reverse order due to FIFO */
+		struct erofs_inode *head, **last = &head;
+		struct erofs_dentry *d;
+
+		dumpdir = dir->next_dirwrite;
+		list_for_each_entry(d, &dir->i_subdirs, d_child) {
+			struct erofs_inode *inode = d->inode;
+
+			if (is_dot_dotdot(d->name) ||
+			    (d->flags & EROFS_DENTRY_FLAG_VALIDNID))
+				continue;
+
+			if (!erofs_inode_visited(inode)) {
+				DBG_BUGON(ctx->rebuild && (inode->i_nlink == 1 ||
+					  S_ISDIR(inode->i_mode)) &&
+					  erofs_parent_inode(inode) != dir);
+				erofs_mark_parent_inode(inode, dir);
+
+				err = erofs_mkfs_handle_inode(ctx, inode);
+				if (err)
+					break;
+				if (S_ISDIR(inode->i_mode)) {
+					inode->next_dirwrite = NULL;
+					*last = inode;
+					last = &inode->next_dirwrite;
+					(void)erofs_igrab(inode);
+				}
+			} else if (!ctx->rebuild) {
+				++inode->i_nlink;
+			}
+		}
+		*last = dumpdir;	/* fixup the last (or the only) one */
+		dumpdir = head;
+		err2 = grouped_dirdata ?
+			erofs_mkfs_push_pending_job(pending_dirs,
+				EROFS_MKFS_JOB_DIR_BH, &dir, sizeof(dir)) :
+			erofs_mkfs_go(ctx, EROFS_MKFS_JOB_DIR_BH,
+				      &dir, sizeof(dir));
+		if (err || err2) {
+			if (!err)
+				err = err2;
+			break;
+		}
+	} while (dumpdir);
+	err2 = erofs_mkfs_flush_pending_jobs(ctx, pending_dirs);
+	return err ? err : err2;
+}
+
 static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 {
 	struct erofs_importer *im = ctx->im;
 	struct erofs_inode *root = im->root;
 	struct erofs_sb_info *sbi = root->sbi;
 	struct erofs_inode *dumpdir = erofs_igrab(root);
+	struct erofs_inode *deferdir = NULL, **deferlast = &deferdir;
+	struct erofs_mkfs_hot_item *hot_queue = NULL;
 	bool grouped_dirdata = im->params->grouped_dirdata;
 	LIST_HEAD(pending_dirs);
+	unsigned int hot_order = 0;
 	int err, err2;
 
 	erofs_mark_parent_inode(root, root);	/* rootdir mark */
 	root->next_dirwrite = NULL;
+	if (erofs_hotfile_enabled()) {
+		root->hotdir = true;
+		root->hot_rank = 0;
+	}
 	/* update dev/i_ino[1] to keep track of the base image */
 	if (ctx->incremental) {
 		root->dev = root->sbi->dev;
@@ -2168,13 +2400,46 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 		sbi->root_nid = root->nid;
 	}
 
+	if (!erofs_hotfile_enabled())
+		return erofs_mkfs_dump_tree_default(ctx, dumpdir, &pending_dirs,
+						    grouped_dirdata);
+
+	err = erofs_mkfs_enqueue_hot_children(root, &hot_queue, &hot_order);
+	if (err)
+		goto out_hot;
+
+	while (hot_queue) {
+		struct erofs_mkfs_hot_item *item = hot_queue;
+		struct erofs_inode *inode = item->inode;
+		struct erofs_inode *parent = item->parent;
+
+		hot_queue = item->next;
+		free(item);
+
+		if (!erofs_inode_visited(inode)) {
+			erofs_mark_parent_inode(inode, parent);
+			err = erofs_mkfs_handle_inode(ctx, inode);
+			if (err)
+				goto out_hot;
+			if (S_ISDIR(inode->i_mode)) {
+				err = erofs_mkfs_enqueue_hot_children(inode,
+								      &hot_queue,
+								      &hot_order);
+				if (err)
+					goto out_hot;
+				inode->hotdir_deferred = true;
+			}
+		}
+	}
+
 	do {
 		struct erofs_inode *dir = dumpdir;
-		/* used for adding sub-directories in reverse order due to FIFO */
 		struct erofs_inode *head, **last = &head;
 		struct erofs_dentry *d;
 
+		err2 = 0;
 		dumpdir = dir->next_dirwrite;
+		dir->next_dirwrite = NULL;
 		list_for_each_entry(d, &dir->i_subdirs, d_child) {
 			struct erofs_inode *inode = d->inode;
 
@@ -2192,16 +2457,37 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 				if (err)
 					break;
 				if (S_ISDIR(inode->i_mode)) {
+					inode->next_dirwrite = NULL;
 					*last = inode;
 					last = &inode->next_dirwrite;
 					(void)erofs_igrab(inode);
 				}
-			} else if (!ctx->rebuild) {
-				++inode->i_nlink;
+			} else {
+				if (S_ISDIR(inode->i_mode) &&
+				    inode->hotdir_deferred) {
+					inode->hotdir_deferred = false;
+					inode->next_dirwrite = NULL;
+					/*
+					 * A hot directory means its own metadata is hot;
+					 * it must not recursively promote all cold
+					 * children beneath it.
+					 */
+					*deferlast = inode;
+					deferlast = &inode->next_dirwrite;
+					(void)erofs_igrab(inode);
+				}
+				if (!ctx->rebuild &&
+				    erofs_parent_inode(inode) != dir)
+					++inode->i_nlink;
 			}
 		}
-		*last = dumpdir;	/* fixup the last (or the only) one */
+		*last = dumpdir;
 		dumpdir = head;
+		if (!dumpdir && deferdir) {
+			dumpdir = deferdir;
+			deferdir = NULL;
+			deferlast = &deferdir;
+		}
 		err2 = grouped_dirdata ?
 			erofs_mkfs_push_pending_job(&pending_dirs,
 				EROFS_MKFS_JOB_DIR_BH, &dir, sizeof(dir)) :
@@ -2214,6 +2500,13 @@ static int erofs_mkfs_dump_tree(const struct erofs_mkfs_btctx *ctx)
 		}
 	} while (dumpdir);
 	err2 = erofs_mkfs_flush_pending_jobs(ctx, &pending_dirs);
+out_hot:
+	while (hot_queue) {
+		struct erofs_mkfs_hot_item *item = hot_queue;
+
+		hot_queue = item->next;
+		free(item);
+	}
 	return err ? err : err2;
 }
 

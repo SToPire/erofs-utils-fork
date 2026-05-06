@@ -265,6 +265,10 @@ struct erofs_inode {
 	bool compressed_idata;
 	bool lazy_tailblock;
 	bool opaque;
+	bool hotfile;
+	bool hotdir;
+	bool hotdir_deferred;
+	u32 hot_rank;
 	/* OVL: non-merge dir that may contain whiteout entries */
 	bool whiteouts;
 	bool dot_omitted;
@@ -572,6 +576,11 @@ extern const char *erofs_frags_packedname;
 static inline bool erofs_is_packed_inode(struct erofs_inode *inode)
 {
 	return inode->i_srcpath == EROFS_PACKED_INODE;
+}
+
+static inline bool erofs_inode_is_hotfile(struct erofs_inode *inode)
+{
+	return inode->hotfile;
 }
 
 int erofs_packedfile_init(struct erofs_sb_info *sbi, bool fragments_mkfs);
