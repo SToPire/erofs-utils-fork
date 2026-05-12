@@ -1547,6 +1547,11 @@ int erofs_xattr_prefixes_init(struct erofs_sb_info *sbi)
 	int ret = 0, i, len;
 	void *buf;
 
+	if (!erofs_sb_has_xattr_prefixes(sbi)) {
+		sbi->xattr_prefix_count = 0;
+		return 0;
+	}
+
 	if (!sbi->xattr_prefix_count)
 		return 0;
 

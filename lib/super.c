@@ -149,7 +149,8 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 	sbi->build_time = le32_to_cpu(dsb->build_time);
 
 	memcpy(&sbi->uuid, dsb->uuid, sizeof(dsb->uuid));
-	if (erofs_sb_has_ishare_xattrs(sbi)) {
+	if (erofs_sb_has_ishare_xattrs(sbi) &&
+	    erofs_sb_has_xattr_prefixes(sbi)) {
 		if (dsb->ishare_xattr_prefix_id >= sbi->xattr_prefix_count) {
 			erofs_err("invalid ishare xattr prefix id %d",
 				  dsb->ishare_xattr_prefix_id);
