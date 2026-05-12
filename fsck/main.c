@@ -1079,13 +1079,15 @@ int main(int argc, char *argv[])
 
 	err = erofs_dev_open(&g_sbi, cfg.c_img_path, O_RDONLY);
 	if (err) {
-		erofs_err("failed to open image file");
+		erofs_err("failed to open image file: %s",
+			  erofs_strerror(err));
 		goto exit;
 	}
 
 	err = erofs_read_superblock(&g_sbi);
 	if (err) {
-		erofs_err("failed to read superblock");
+		erofs_err("failed to read superblock: %s",
+			  erofs_strerror(err));
 		goto exit_dev_close;
 	}
 
@@ -1104,7 +1106,8 @@ int main(int argc, char *argv[])
 
 		err = erofs_ilookup(fsckcfg.inode_path, &inode);
 		if (err) {
-			erofs_err("failed to lookup %s", fsckcfg.inode_path);
+			erofs_err("failed to lookup %s: %s",
+				  fsckcfg.inode_path, erofs_strerror(err));
 			goto exit_hardlink;
 		}
 		fsckcfg.nid = inode.nid;
@@ -1123,7 +1126,8 @@ int main(int argc, char *argv[])
 
 			err = erofsfsck_check_inode(g_sbi.packed_nid, g_sbi.packed_nid);
 			if (err) {
-				erofs_err("failed to verify packed file");
+				erofs_err("failed to verify packed file: %s",
+					  erofs_strerror(err));
 				goto exit_packedinode;
 			}
 		}
