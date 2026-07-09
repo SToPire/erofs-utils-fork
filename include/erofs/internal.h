@@ -212,8 +212,11 @@ struct erofs_diskbuf;
 
 enum erofs_idata_type {
 	EROFS_IDATA_TYPE_RAW,
-	EROFS_IDATA_TYPE_COMPRESSED_DEFAULT,
+	EROFS_IDATA_TYPE_COMPRESSED,
+	/* compressed idata follows a final 2B compacted index pack */
 	EROFS_IDATA_TYPE_COMPRESSED_END_OF_2B,
+	/* compressed idata follows a final single-entry 4B pack after a 2B pack */
+	EROFS_IDATA_TYPE_COMPRESSED_4B1_PREV2B,
 };
 
 #define EROFS_I_BLKADDR_DEV_ID_BIT		48
