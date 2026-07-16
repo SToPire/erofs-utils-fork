@@ -507,7 +507,9 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 		datablob_size += round_up(inode->i_size, erofs_blksiz(sbi));
 	}
 	chunksize = 1ULL << chunkbits;
-	count = DIV_ROUND_UP(inode->i_size, chunksize);
+	/* e.g. DIV_ROUND_UP(UINT64_MAX, 1 TiB) can overflow */
+	count = (inode->i_size >> chunkbits) +
+		!!(inode->i_size & (chunksize - 1));
 
 	inode->extent_isize = count * unit;
 	idx = calloc(count, max(sizeof(*idx), sizeof(void *)));
