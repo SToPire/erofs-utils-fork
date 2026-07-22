@@ -1073,6 +1073,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				  int argc, char *argv[])
 {
 	bool has_timestamp = false;
+	bool has_xattr_prefix_opt = false;
 	bool quiet = false;
 	char *endptr;
 	int opt, err;
@@ -1483,6 +1484,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				return opt;
 			}
 			cfg.c_extra_ea_name_prefixes = true;
+			has_xattr_prefix_opt = true;
 			break;
 		case 539:
 			if (!optarg)
@@ -1493,6 +1495,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 					  erofs_strerror(err));
 				return err;
 			}
+			has_xattr_prefix_opt = true;
 			break;
 		case 'V':
 			version();
@@ -1504,6 +1507,11 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		default: /* '?' */
 			return -EINVAL;
 		}
+	}
+
+	if (incremental_mode && has_xattr_prefix_opt) {
+		erofs_err("--incremental cannot be used with --xattr-prefix or --xattr-inode-digest");
+		return -EINVAL;
 	}
 
 	if (cfg.c_blobdev_path && cfg.c_chunkbits < mkfs_blkszbits) {

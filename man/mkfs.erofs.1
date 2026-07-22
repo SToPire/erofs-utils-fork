@@ -321,6 +321,8 @@ Run an incremental build where DESTINATION is an existing EROFS image,
 and the data specified by SOURCE will be incrementally appended to the image.
 \fIMODE\fR has the same meaning as in \fB\-\-clean\fR above.
 Incremental build is unsupported for \fB\-\-s3\fR and \fB\-\-oci\fR sources.
+It also cannot currently be combined with \fB\-\-xattr-prefix\fR or
+\fB\-\-xattr-inode-digest\fR.
 
 If \fB\-\-incremental\fR is specified without an explicit value, it is treated
 as \fB\-\-incremental=data\fR.
