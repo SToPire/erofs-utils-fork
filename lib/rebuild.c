@@ -82,8 +82,60 @@ struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
 	return NULL;
 }
 
-struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
-		char *path, bool aufs, bool *whout, bool *opq, bool to_head)
+/* Bound symlink chains during path resolution, like the kernel's MAXSYMLINKS. */
+#define EROFS_REBUILD_SYMLINK_DEPTH	40
+
+static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
+		struct erofs_inode *pwd, char *path, bool aufs,
+		bool *whout, bool *opq, bool to_head, unsigned int depth);
+
+/*
+ * Resolve the target of an intermediate symlink path component to its
+ * directory inode, following chained symlinks up to a bounded depth.  This
+ * lets tar layers that store files under a symlinked directory be converted
+ * the same way a real filesystem extracts them, e.g. usr-merge layouts where
+ * "/lib64 -> usr/lib64" coexists with entries such as "lib64/libc.so.6".
+ */
+static struct erofs_inode *erofs_rebuild_follow_link(struct erofs_inode *root,
+		struct erofs_inode *pwd, struct erofs_inode *link,
+		unsigned int depth)
+{
+	struct erofs_dentry *d;
+	struct erofs_inode *base;
+	bool dumb_wh, dumb_opq;
+	char *target;
+
+	if (depth >= EROFS_REBUILD_SYMLINK_DEPTH)
+		return ERR_PTR(-ELOOP);
+	if (!link->i_link)
+		return ERR_PTR(-ENOENT);
+
+	target = strdup(link->i_link);
+	if (!target)
+		return ERR_PTR(-ENOMEM);
+
+	/* absolute targets are resolved from the tree root */
+	base = target[0] == '/' ? root : pwd;
+	d = __erofs_rebuild_get_dentry(root, base, target, false,
+				       &dumb_wh, &dumb_opq, false, depth + 1);
+	free(target);
+	if (IS_ERR(d))
+		return ERR_CAST(d);
+	/* target referred to the root or the base directory itself ("/", ".") */
+	if (!d)
+		return base;
+	if (d->type == EROFS_FT_DIR)
+		return d->inode;
+	/* the target is itself a symlink: keep following the chain */
+	if (d->type == EROFS_FT_SYMLINK)
+		return erofs_rebuild_follow_link(root, d->inode->i_parent,
+						 d->inode, depth + 1);
+	return ERR_PTR(-ENOTDIR);
+}
+
+static struct erofs_dentry *__erofs_rebuild_get_dentry(struct erofs_inode *root,
+		struct erofs_inode *pwd, char *path, bool aufs,
+		bool *whout, bool *opq, bool to_head, unsigned int depth)
 {
 	struct erofs_dentry *d = NULL;
 	char *s = path;
@@ -121,6 +173,15 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 			}
 
 			d = erofs_d_lookup(pwd, s);
+			if (d && slash && d->type == EROFS_FT_SYMLINK) {
+				pwd = erofs_rebuild_follow_link(root, pwd,
+							d->inode, depth);
+				if (IS_ERR(pwd))
+					return ERR_CAST(pwd);
+				*slash = '/';
+				s = slash + 1;
+				continue;
+			}
 			if (d) {
 				if (d->type != EROFS_FT_DIR) {
 					if (slash)
@@ -150,6 +211,13 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 		s = slash + 1;
 	}
 	return d;
+}
+
+struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
+		char *path, bool aufs, bool *whout, bool *opq, bool to_head)
+{
+	return __erofs_rebuild_get_dentry(pwd, pwd, path, aufs, whout, opq,
+					  to_head, 0);
 }
 
 static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
