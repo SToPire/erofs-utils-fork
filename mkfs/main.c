@@ -26,6 +26,7 @@
 #include "erofs/compress_hints.h"
 #include "erofs/blobchunk.h"
 #include "../lib/compressor.h"
+#include "../lib/liberofs_dm_persistent.h"
 #include "../lib/liberofs_file_delta.h"
 #include "../lib/liberofs_gzran.h"
 #include "../lib/liberofs_metabox.h"
@@ -331,6 +332,7 @@ static unsigned int rebuild_src_count;
 static LIST_HEAD(rebuild_src_list);
 static LIST_HEAD(file_deltas);
 static const struct erofs_file_delta_ops * const file_delta_backends[] = {
+	&erofs_file_delta_dm_persistent_ops,
 	NULL,
 };
 static unsigned int blobdev_device_id;

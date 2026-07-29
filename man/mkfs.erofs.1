@@ -392,6 +392,22 @@ redundant \fB-b\fR option.
 The source specification is the remainder after the second colon, so it may
 itself contain colons.  Repeated file-delta options must use distinct TARGET
 paths.  A source may be reused when the selected backend permits it.
+.RS
+.TP
+.B dm-persistent
+Treat \fISOURCE\fR as a Linux dm-persistent snapshot exception store version
+1.  Each exception replaces the target chunk identified by
+\fBold_chunk\fR with the payload at \fBnew_chunk\fR.  The target chunk size,
+dm chunk size, and \fB\-\-chunksize\fR must be equal.
+
+The source can be a regular file or block device and must remain unchanged for
+the complete build.  Its header must have magic \fB0x70416e53\fR,
+\fBvalid=1\fR, version 1, and a power-of-two chunk size.  The implementation
+limits a chunk to 64 MiB and a store to 16777216 exceptions.  File-delta chunk
+sizes above 64 MiB are rejected before either output is opened or created.
+FIFOs and other unsupported source object types are rejected without waiting
+for a peer to open them.
+.RE
 .TP
 .BI "\-\-max-extent-bytes=" #
 Specify maximum decompressed extent size in bytes. The default is unlimited.
