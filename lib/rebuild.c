@@ -15,6 +15,7 @@
 #include "erofs/blobchunk.h"
 #include "erofs/internal.h"
 #include "erofs/io.h"
+#include "liberofs_file_delta.h"
 #include "liberofs_rebuild.h"
 #include "liberofs_uuid.h"
 
@@ -72,7 +73,8 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 	return d;
 }
 
-struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
+static struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir,
+					  const char *name)
 {
 	struct erofs_dentry *d;
 
@@ -153,24 +155,35 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 }
 
 static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
-					  struct erofs_inode *inode)
+					  struct erofs_inode *inode,
+					  struct erofs_file_delta_manager *file_deltas)
 {
+	struct erofs_sb_info *src_sb = inode->sbi;
+	bool preserve = file_deltas && file_deltas->initialized;
+	struct erofs_file_delta *delta = NULL;
 	int ret;
 	unsigned int count, unit, chunkbits, i;
-	struct erofs_inode_chunk_index *idx;
+	u64 count64;
+	struct erofs_chunkitem **idx;
 	erofs_off_t chunksize;
-	erofs_blk_t blkaddr;
 
 	/* TODO: fill data map in other layouts */
 	if (inode->datalayout == EROFS_INODE_CHUNK_BASED) {
 		chunkbits = inode->u.chunkbits;
+		if (preserve && !(inode->u.chunkformat &
+				  EROFS_CHUNK_FORMAT_INDEXES)) {
+			erofs_err("%s: parent chunk file has no device IDs",
+				  inode->i_srcpath);
+			return -EOPNOTSUPP;
+		}
 		if (chunkbits < dst_sb->blkszbits) {
 			erofs_err("%s: chunk size %u is smaller than the target block size %u",
 				  inode->i_srcpath, 1U << chunkbits,
 				  1U << dst_sb->blkszbits);
 			return -EINVAL;
 		}
-	} else if (inode->datalayout == EROFS_INODE_FLAT_PLAIN) {
+	} else if (!preserve &&
+		   inode->datalayout == EROFS_INODE_FLAT_PLAIN) {
 		chunkbits = ilog2(inode->i_size - 1) + 1;
 		if (chunkbits < dst_sb->blkszbits)
 			chunkbits = dst_sb->blkszbits;
@@ -183,11 +196,17 @@ static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
 	}
 
 	chunksize = 1ULL << chunkbits;
-	count = DIV_ROUND_UP(inode->i_size, chunksize);
-
 	unit = sizeof(struct erofs_inode_chunk_index);
+	count64 = inode->i_size / chunksize +
+		!!(inode->i_size % chunksize);
+	if (count64 > INT_MAX / unit) {
+		erofs_err("%s: too many chunk indexes", inode->i_srcpath);
+		return -E2BIG;
+	}
+	count = count64;
 	inode->extent_isize = count * unit;
-	idx = calloc(count, max(sizeof(*idx), sizeof(void *)));
+	idx = calloc(count, max(sizeof(struct erofs_inode_chunk_index),
+				 sizeof(*idx)));
 	if (!idx)
 		return -ENOMEM;
 	inode->chunkindexes = idx;
@@ -198,23 +217,59 @@ static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
 			.buf = __EROFS_BUF_INITIALIZER,
 		};
 
-		map.m_la = i << chunkbits;
+		map.m_la = (erofs_off_t)i << chunkbits;
 		ret = erofs_map_blocks(inode, &map, 0);
 		if (ret)
 			goto err;
 
-		blkaddr = erofs_blknr(dst_sb, map.m_pa);
-		chunk = erofs_get_unhashed_chunk(dst_sb, inode->dev, blkaddr, 0);
+		if (!(map.m_flags & EROFS_MAP_MAPPED)) {
+			chunk = erofs_get_unhashed_chunk(dst_sb, 0,
+						   EROFS_NULL_ADDR, 0);
+		} else if (preserve) {
+			struct erofs_device_info *dif;
+			erofs_blk_t startblk, nblocks;
+
+			if (!map.m_deviceid ||
+			    map.m_deviceid > src_sb->extra_devices ||
+			    erofs_blkoff(src_sb, map.m_pa)) {
+				erofs_err("%s: parent data is not on an explicit external device",
+					  inode->i_srcpath);
+				ret = -EOPNOTSUPP;
+				goto err;
+			}
+			dif = &src_sb->devs[map.m_deviceid - 1];
+			startblk = erofs_blknr(src_sb, map.m_pa);
+			nblocks = BLK_ROUND_UP(src_sb, map.m_plen);
+			if (startblk >= dif->blocks ||
+			    nblocks > dif->blocks - startblk) {
+				erofs_err("%s: parent chunk range exceeds external device %u",
+					  inode->i_srcpath, map.m_deviceid);
+				ret = -EFSCORRUPTED;
+				goto err;
+			}
+			chunk = erofs_get_unhashed_chunk(dst_sb, map.m_deviceid,
+						   startblk, 0);
+		} else {
+			chunk = erofs_get_unhashed_chunk(dst_sb, inode->dev,
+						   erofs_blknr(dst_sb, map.m_pa), 0);
+		}
 		if (IS_ERR(chunk)) {
 			ret = PTR_ERR(chunk);
 			goto err;
 		}
-		*(void **)idx++ = chunk;
+		*idx++ = chunk;
 
 	}
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	inode->u.chunkformat = EROFS_CHUNK_FORMAT_INDEXES;
 	inode->u.chunkformat |= chunkbits - dst_sb->blkszbits;
+	if (preserve) {
+		delta = erofs_file_delta_lookup_target(file_deltas,
+						       inode->i_srcpath);
+		if (delta)
+			return erofs_file_delta_apply(file_deltas, delta, inode,
+						      dst_sb);
+	}
 	return 0;
 err:
 	free(inode->chunkindexes);
@@ -289,7 +344,8 @@ static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
 
 static int erofs_rebuild_update_inode(struct erofs_sb_info *dst_sb,
 				      struct erofs_inode *inode,
-				      enum erofs_rebuild_datamode datamode)
+				      enum erofs_rebuild_datamode datamode,
+				      struct erofs_file_delta_manager *file_deltas)
 {
 	int err = 0;
 
@@ -324,11 +380,13 @@ static int erofs_rebuild_update_inode(struct erofs_sb_info *dst_sb,
 	}
 	case S_IFREG:
 		if (!inode->i_size) {
+			inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 			inode->u.i_blkaddr = EROFS_NULL_ADDR;
 			break;
 		}
 		if (datamode == EROFS_REBUILD_DATA_BLOB_INDEX)
-			err = erofs_rebuild_write_blob_index(dst_sb, inode);
+			err = erofs_rebuild_write_blob_index(dst_sb, inode,
+							 file_deltas);
 		else if (datamode == EROFS_REBUILD_DATA_RESVSP)
 			inode->datasource = EROFS_INODE_DATA_SOURCE_RESVSP;
 		else if (datamode == EROFS_REBUILD_DATA_FULL)
@@ -354,6 +412,7 @@ struct erofs_rebuild_dir_context {
 			unsigned int *i_nlink;
 		};
 	};
+	struct erofs_file_delta_manager *file_deltas;
 };
 
 static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
@@ -462,7 +521,8 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 			inode->i_nlink = 1;
 
 			ret = erofs_rebuild_update_inode(&g_sbi, inode,
-							 rctx->datamode);
+							 rctx->datamode,
+							 rctx->file_deltas);
 			if (ret) {
 				erofs_iput(inode);
 				goto out;
@@ -494,8 +554,32 @@ out:
 	return ret;
 }
 
+static int erofs_rebuild_copy_root_metadata(struct erofs_inode *root,
+					    struct erofs_inode *src)
+{
+	int ret;
+
+	ret = erofs_read_xattrs_from_disk(src);
+	if (ret) {
+		erofs_inode_free_xattrs(src);
+		return ret;
+	}
+	root->i_mode = src->i_mode;
+	root->i_uid = src->i_uid;
+	root->i_gid = src->i_gid;
+	root->i_mtime = src->i_mtime;
+	root->i_mtime_nsec = src->i_mtime_nsec;
+	root->opaque = src->opaque;
+	root->whiteouts = src->whiteouts;
+	list_splice_tail(&src->i_xattrs, &root->i_xattrs);
+	init_list_head(&src->i_xattrs);
+	erofs_inode_free_xattrs(src);
+	return 0;
+}
+
 int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
-			    enum erofs_rebuild_datamode mode)
+			    enum erofs_rebuild_datamode mode,
+			    struct erofs_file_delta_manager *file_deltas)
 {
 	struct erofs_inode inode = {};
 	struct erofs_rebuild_dir_context ctx;
@@ -524,12 +608,20 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 	inode.i_srcpath = strdup("/");
 	if (!inode.i_srcpath)
 		return -ENOMEM;
+	if (file_deltas) {
+		ret = erofs_rebuild_copy_root_metadata(root, &inode);
+		if (ret) {
+			free(inode.i_srcpath);
+			return ret;
+		}
+	}
 
 	ctx = (struct erofs_rebuild_dir_context) {
 		.ctx.dir = &inode,
 		.ctx.cb = erofs_rebuild_dirent_iter,
 		.mergedir = root,
 		.datamode = mode,
+		.file_deltas = file_deltas,
 	};
 	ret = erofs_iterate_dir(&ctx.ctx, false);
 	free(inode.i_srcpath);

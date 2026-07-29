@@ -297,13 +297,39 @@ int erofs_dev_open(struct erofs_sb_info *sbi, const char *dev, int flags)
 
 repeat:
 #endif
-	fd = open(dev, (ro ? O_RDONLY : O_RDWR | O_CREAT) | O_BINARY, 0644);
+	fd = open(dev, (ro ? O_RDONLY | O_NONBLOCK : O_RDWR | O_CREAT) |
+		  O_BINARY, 0644);
 	if (fd < 0) {
 		erofs_err("failed to open %s: %s", dev, strerror(errno));
 		return -errno;
 	}
 
-	if (ro || !truncate)
+	if (ro) {
+		ret = fstat(fd, &st);
+		if (ret) {
+			ret = -errno;
+			erofs_err("failed to fstat(%s): %s", dev,
+				  erofs_strerror(ret));
+			close(fd);
+			return ret;
+		}
+		if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode)) {
+			erofs_err("bad file type (%s, %o).", dev, st.st_mode);
+			close(fd);
+			return -EINVAL;
+		}
+		ret = fcntl(fd, F_GETFL);
+		if (ret < 0 || fcntl(fd, F_SETFL, ret & ~O_NONBLOCK)) {
+			ret = -errno;
+			erofs_err("failed to clear O_NONBLOCK on %s: %s", dev,
+				  erofs_strerror(ret));
+			close(fd);
+			return ret;
+		}
+		goto out;
+	}
+
+	if (!truncate)
 		goto out;
 
 	ret = fstat(fd, &st);
@@ -397,7 +423,14 @@ void erofs_blob_closeall(struct erofs_sb_info *sbi)
 
 int erofs_blob_open_ro(struct erofs_sb_info *sbi, const char *dev)
 {
-	int fd = open(dev, O_RDONLY | O_BINARY);
+	int fd;
+
+	if (sbi->nblobs >= EROFS_MAX_BLOB_DEVS) {
+		erofs_err("too many blob devices (maximum %u)",
+			  EROFS_MAX_BLOB_DEVS);
+		return -E2BIG;
+	}
+	fd = open(dev, O_RDONLY | O_BINARY);
 
 	if (fd < 0) {
 		erofs_err("failed to open(%s).", dev);

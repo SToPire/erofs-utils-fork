@@ -45,6 +45,8 @@ typedef u64 erofs_off_t;
 typedef u64 erofs_nid_t;
 typedef u64 erofs_blk_t;
 
+#define EROFS_MAX_BLOB_DEVS	256U
+
 /* global sbi */
 extern struct erofs_sb_info g_sbi;
 
@@ -140,7 +142,7 @@ struct erofs_sb_info {
 	u64 devsz;
 	dev_t dev;
 	unsigned int nblobs;
-	unsigned int blobfd[256];
+	unsigned int blobfd[EROFS_MAX_BLOB_DEVS];
 
 	struct list_head list;
 
@@ -204,7 +206,6 @@ EROFS_FEATURE_FUNCS(ishare_xattrs, compat, COMPAT_ISHARE_XATTRS)
 #define EROFS_I_Z_INITED	(1 << EROFS_I_Z_INITED_BIT)
 
 struct erofs_diskbuf;
-
 #define EROFS_INODE_DATA_SOURCE_NONE		0
 #define EROFS_INODE_DATA_SOURCE_LOCALPATH	1
 #define EROFS_INODE_DATA_SOURCE_DISKBUF		2

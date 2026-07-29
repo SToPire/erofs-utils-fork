@@ -1185,9 +1185,11 @@ out:
 }
 
 static bool erofs_should_use_inode_extended(struct erofs_importer *im,
-				struct erofs_inode *inode, const char *path)
+					struct erofs_inode *inode, const char *path)
 {
 	const struct erofs_importer_params *params = im->params;
+	struct erofs_sb_info *sbi = inode->sbi;
+	bool mtime_out_of_range;
 
 	if (params->force_inodeversion == EROFS_FORCE_INODE_EXTENDED)
 		return true;
@@ -1201,12 +1203,16 @@ static bool erofs_should_use_inode_extended(struct erofs_importer *im,
 		return true;
 	if (inode->i_nlink > USHRT_MAX)
 		return true;
-	if (!erofs_is_special_identifier(path) &&
-	    !erofs_sb_has_48bit(inode->sbi) &&
-	    inode->i_mtime != inode->sbi->epoch) {
+	mtime_out_of_range = inode->i_mtime_nsec != sbi->fixed_nsec ||
+		(erofs_sb_has_48bit(sbi) ?
+		inode->i_mtime < sbi->epoch ||
+		inode->i_mtime - sbi->epoch > UINT32_MAX :
+		inode->i_mtime != sbi->epoch);
+	if (!erofs_is_special_identifier(path) && mtime_out_of_range) {
 		if (!params->ignore_mtime)
 			return true;
-		inode->i_mtime = inode->sbi->epoch;
+		inode->i_mtime = sbi->epoch + sbi->build_time;
+		inode->i_mtime_nsec = sbi->fixed_nsec;
 	}
 	return false;
 }
@@ -1457,9 +1463,11 @@ static void erofs_fixup_meta_blkaddr(struct erofs_inode *root)
 			sbi->meta_blkaddr = erofs_blknr(sbi, meta_offset);
 		}
 	} else if (!erofs_sb_has_48bit(sbi)) {
-		sbi->build_time = sbi->epoch;
-		sbi->epoch = max_t(s64, 0, (s64)sbi->build_time - UINT32_MAX);
-		sbi->build_time -= sbi->epoch;
+		u64 build_time = sbi->epoch + sbi->build_time;
+
+		sbi->epoch = build_time > UINT32_MAX ?
+			build_time - UINT32_MAX : 0;
+		sbi->build_time = build_time - sbi->epoch;
 		erofs_sb_set_48bit(sbi);
 	}
 	root->nid = ((off - meta_offset) >> EROFS_ISLOTBITS) |
@@ -1988,12 +1996,12 @@ static int erofs_prepare_dir_inode(const struct erofs_mkfs_btctx *ctx,
 	return 0;
 }
 
-static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
+static int erofs_set_inode_fingerprint(struct erofs_inode *inode,
+				       struct erofs_vfile *vf,
 				       erofs_off_t pos)
 {
 	u8 ishare_xattr_prefix_id = inode->sbi->ishare_xattr_prefix_id;
 	erofs_off_t remaining = inode->i_size;
-	struct erofs_vfile vf = { .fd = fd };
 	struct sha256_state md;
 	u8 out[32 + sizeof("sha256:") - 1];
 	int ret;
@@ -2004,7 +2012,7 @@ static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
 	do {
 		u8 buf[32768];
 
-		ret = erofs_io_pread(&vf, buf,
+		ret = erofs_io_pread(vf, buf,
 				     min_t(u64, remaining, sizeof(buf)), pos);
 		if (ret < 0)
 			return ret;
@@ -2049,7 +2057,9 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 			goto out;
 		}
 
-		ret = erofs_set_inode_fingerprint(inode, ctx.fd, ctx.fpos);
+		ret = erofs_set_inode_fingerprint(inode,
+					&(struct erofs_vfile){ .fd = ctx.fd },
+					ctx.fpos);
 		if (ret < 0)
 			return ret;
 

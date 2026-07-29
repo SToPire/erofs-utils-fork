@@ -26,6 +26,7 @@
 #include "erofs/compress_hints.h"
 #include "erofs/blobchunk.h"
 #include "../lib/compressor.h"
+#include "../lib/liberofs_file_delta.h"
 #include "../lib/liberofs_gzran.h"
 #include "../lib/liberofs_metabox.h"
 #include "../lib/liberofs_oci.h"
@@ -105,6 +106,7 @@ static struct option long_options[] = {
 	{"MZ", optional_argument, NULL, 537},
 	{"xattr-prefix", required_argument, NULL, 538},
 	{"xattr-inode-digest", optional_argument, NULL, 539},
+	{"file-delta", required_argument, NULL, 540},
 	{0, 0, 0, 0},
 };
 
@@ -201,6 +203,7 @@ static void usage(int argc, char **argv)
 		" --dsunit=#             align all data block addresses to multiples of #\n"
 		" --exclude-path=X       avoid including file X (X = exact literal path)\n"
 		" --exclude-regex=X      avoid including files that match X (X = regular expression)\n"
+		" --file-delta=X         rebuild TARGET with X=FORMAT:TARGET:SOURCE into --blobdev\n"
 #ifdef HAVE_LIBSELINUX
 		" --file-contexts=X      specify a file contexts file to setup selinux labels\n"
 #endif
@@ -326,6 +329,11 @@ static enum {
 
 static unsigned int rebuild_src_count;
 static LIST_HEAD(rebuild_src_list);
+static LIST_HEAD(file_deltas);
+static const struct erofs_file_delta_ops * const file_delta_backends[] = {
+	NULL,
+};
+static unsigned int blobdev_device_id;
 static u8 fixeduuid[16];
 static bool valid_fixeduuid;
 static unsigned int dsunit;
@@ -1075,6 +1083,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 	bool has_timestamp = false;
 	bool quiet = false;
 	char *endptr;
+	unsigned long chunksize;
 	int opt, err;
 	long i;
 
@@ -1260,17 +1269,16 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		}
 
 		case 11:
-			i = strtol(optarg, &endptr, 0);
-			if (*endptr != '\0') {
-				erofs_err("invalid chunksize %s", optarg);
-				return -EINVAL;
-			}
-			cfg.c_chunkbits = ilog2(i);
-			if ((1 << cfg.c_chunkbits) != i) {
+			errno = 0;
+			chunksize = strtoul(optarg, &endptr, 0);
+			if (errno || endptr == optarg || *endptr != '\0' ||
+			    optarg[0] == '-' || !chunksize || chunksize > INT_MAX ||
+			    (chunksize & (chunksize - 1))) {
 				erofs_err("chunksize %s must be a power of two",
 					  optarg);
 				return -EINVAL;
 			}
+			cfg.c_chunkbits = ilog2(chunksize);
 			erofs_sb_set_chunked_file(&g_sbi);
 			break;
 		case 12:
@@ -1494,6 +1502,15 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				return err;
 			}
 			break;
+		case 540:
+			err = erofs_file_delta_parse_spec(&file_deltas, optarg,
+						  file_delta_backends);
+			if (err) {
+				erofs_err("invalid --file-delta=%s: %s", optarg,
+					  erofs_strerror(err));
+				return err;
+			}
+			break;
 		case 'V':
 			version();
 			exit(0);
@@ -1506,7 +1523,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		}
 	}
 
-	if (cfg.c_blobdev_path && cfg.c_chunkbits < mkfs_blkszbits) {
+	if (list_empty(&file_deltas) && cfg.c_blobdev_path &&
+	    cfg.c_chunkbits < mkfs_blkszbits) {
 		erofs_err("--blobdev must be used together with --chunksize");
 		return -EINVAL;
 	}
@@ -1549,6 +1567,27 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			return err;
 	}
 
+	if (!list_empty(&file_deltas)) {
+		if (incremental_mode ||
+		    source_mode != EROFS_MKFS_SOURCE_REBUILD ||
+		    rebuild_src_count != 1 || !cfg.c_blobdev_path ||
+		    !cfg.c_chunkbits ||
+		    cfg.c_force_chunkformat != FORCE_INODE_CHUNK_INDEXES ||
+		    dataimport_mode != EROFS_MKFS_DATA_IMPORT_DEFAULT) {
+			erofs_err("--file-delta requires one rebuild parent, --chunksize, "
+				  "--blobdev, -Eforce-chunk-indexes and default blob-index mode");
+			return -EINVAL;
+		}
+		if (erofs_sb_has_ishare_xattrs(&g_sbi)) {
+			erofs_err("--xattr-inode-digest is unsupported with --file-delta");
+			return -EOPNOTSUPP;
+		}
+		err = erofs_file_delta_validate_config(&file_deltas,
+						       cfg.c_chunkbits);
+		if (err)
+			return err;
+	}
+
 	if (quiet) {
 		cfg.c_dbg_lvl = EROFS_ERR;
 		cfg.c_showprogress = false;
@@ -1564,7 +1603,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		params->pclusterblks_max = pclustersize_max >> mkfs_blkszbits;
 		params->pclusterblks_def = params->pclusterblks_max;
 	}
-	if (cfg.c_chunkbits && cfg.c_chunkbits < mkfs_blkszbits) {
+	if (list_empty(&file_deltas) && cfg.c_chunkbits &&
+	    cfg.c_chunkbits < mkfs_blkszbits) {
 		erofs_err("chunksize %u must be larger than block size",
 			  1u << cfg.c_chunkbits);
 		return -EINVAL;
@@ -1657,7 +1697,8 @@ void erofs_show_progs(int argc, char *argv[])
 		printf("%s %s\n", basename(argv[0]), cfg.c_version);
 }
 
-static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
+static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root,
+		struct erofs_file_delta_manager *file_delta_mgr)
 {
 	struct erofs_device_info *devs;
 	struct erofs_sb_info *src;
@@ -1680,9 +1721,52 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 		return -EINVAL;
 	}
 
+	if (!list_empty(&file_deltas)) {
+		src = list_first_entry(&rebuild_src_list,
+				       struct erofs_sb_info, list);
+		if (datamode != EROFS_REBUILD_DATA_BLOB_INDEX ||
+		    rebuild_src_count != 1 ||
+		    blobdev_device_id != src->extra_devices + 1)
+			return -EINVAL;
+
+		ret = erofs_mkfs_init_devices(&g_sbi, src->extra_devices + 1);
+		if (ret)
+			return ret;
+		if (erofs_sb_has_48bit(src))
+			erofs_sb_set_48bit(&g_sbi);
+		for (idx = 0; idx < src->extra_devices; ++idx) {
+			g_sbi.devs[idx].blocks = src->devs[idx].blocks;
+			memcpy(g_sbi.devs[idx].tag, src->devs[idx].tag,
+			       sizeof(g_sbi.devs[idx].tag));
+		}
+		idx = blobdev_device_id - 1;
+		g_sbi.devs[idx].src_path = strdup(cfg.c_blobdev_path);
+		if (!g_sbi.devs[idx].src_path)
+			return -ENOMEM;
+		ret = erofs_blob_init_device(&g_sbi, blobdev_device_id);
+		if (ret)
+			return ret;
+		ret = erofs_blob_init(&g_sbi, blobdev_device_id,
+				      cfg.c_chunkbits);
+		if (ret)
+			return ret;
+
+		ret = erofs_file_delta_manager_init(file_delta_mgr, src,
+				&file_deltas, cfg.c_chunkbits);
+		if (ret)
+			return ret;
+		src->xamgr = g_sbi.xamgr;
+		ret = erofs_rebuild_load_tree(root, src, datamode,
+					      file_delta_mgr);
+		src->xamgr = NULL;
+		if (ret)
+			return ret;
+		return erofs_file_delta_manager_finish(file_delta_mgr);
+	}
+
 	list_for_each_entry(src, &rebuild_src_list, list) {
 		src->xamgr = g_sbi.xamgr;
-		ret = erofs_rebuild_load_tree(root, src, datamode);
+		ret = erofs_rebuild_load_tree(root, src, datamode, NULL);
 		src->xamgr = NULL;
 		if (ret) {
 			erofs_err("failed to load %s", src->dif0.src_path);
@@ -1760,6 +1844,7 @@ static void erofs_mkfs_showsummaries(void)
 int main(int argc, char **argv)
 {
 	struct erofs_importer_params importer_params;
+	struct erofs_file_delta_manager file_delta_mgr = {};
 	struct erofs_importer importer = {
 		.params = &importer_params,
 		.sbi = &g_sbi,
@@ -1853,6 +1938,29 @@ int main(int argc, char **argv)
 			goto exit;
 		}
 		mkfs_blkszbits = src->blkszbits;
+		if (!list_empty(&file_deltas)) {
+			if (erofs_sb_has_ishare_xattrs(src)) {
+				erofs_err("file-delta parent uses inode digest xattrs");
+				err = -EOPNOTSUPP;
+				goto exit;
+			}
+			if (cfg.c_chunkbits < mkfs_blkszbits) {
+				erofs_err("chunksize %u must be at least parent block size %u",
+					  1U << cfg.c_chunkbits,
+					  1U << mkfs_blkszbits);
+				err = -EINVAL;
+				goto exit;
+			}
+			if (erofs_sb_has_48bit(src))
+				erofs_sb_set_48bit(&g_sbi);
+			if (src->extra_devices >= EROFS_MAX_BLOB_DEVS) {
+				erofs_err("file-delta supports at most %u external devices",
+					  EROFS_MAX_BLOB_DEVS);
+				err = -E2BIG;
+				goto exit;
+			}
+			blobdev_device_id = src->extra_devices + 1;
+		}
 	} else if (mkfs_oci_tarindex_mode) {
 		mkfs_blkszbits = 9;
 		tar_index_512b = true;
@@ -1865,7 +1973,6 @@ int main(int argc, char **argv)
 		err = erofs_mkfs_load_fs(&g_sbi, dsunit);
 	if (err)
 		goto exit;
-
 	/* Use the user-defined UUID or generate one for clean builds */
 	if (valid_fixeduuid)
 		memcpy(g_sbi.uuid, fixeduuid, sizeof(g_sbi.uuid));
@@ -1915,7 +2022,8 @@ int main(int argc, char **argv)
 	}
 
 	cfg.c_dedupe = importer_params.dedupe;
-	if (tar_index_512b || cfg.c_blobdev_path) {
+	if ((tar_index_512b || cfg.c_blobdev_path) &&
+	    list_empty(&file_deltas)) {
 		err = erofs_mkfs_init_devices(&g_sbi, 1);
 		if (err) {
 			erofs_err("failed to generate device table: %s",
@@ -1924,7 +2032,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (tar_index_512b || cfg.c_chunkbits) {
+	if ((tar_index_512b || cfg.c_chunkbits) &&
+	    list_empty(&file_deltas)) {
 		if (g_sbi.extra_devices && cfg.c_blobdev_path) {
 			g_sbi.devs[0].src_path = strdup(cfg.c_blobdev_path);
 			if (!g_sbi.devs[0].src_path) {
@@ -1985,7 +2094,7 @@ int main(int argc, char **argv)
 		while (!(err = tarerofs_parse_tar(&importer, &erofstar)))
 			;
 	} else if (source_mode == EROFS_MKFS_SOURCE_REBUILD) {
-		err = erofs_mkfs_rebuild_load_trees(root);
+		err = erofs_mkfs_rebuild_load_trees(root, &file_delta_mgr);
 #ifdef S3EROFS_ENABLED
 	} else if (source_mode == EROFS_MKFS_SOURCE_S3) {
 		if (!s3cfg.access_key[0] && getenv("AWS_ACCESS_KEY_ID")) {
@@ -2078,6 +2187,8 @@ int main(int argc, char **argv)
 exit:
 	if (root)
 		erofs_iput(root);
+	erofs_file_delta_manager_exit(&file_delta_mgr);
+	erofs_file_delta_cleanup(&file_deltas);
 	z_erofs_dedupe_exit();
 	blklst = erofs_blocklist_close();
 	if (blklst)

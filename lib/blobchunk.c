@@ -12,6 +12,8 @@
 #include "liberofs_cache.h"
 #include "liberofs_private.h"
 #include "liberofs_sha256.h"
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 struct erofs_chunkitem {
@@ -35,6 +37,7 @@ struct erofs_chunkmgr {
 	struct list_head chunks[65536];
 	struct list_head unhashed_chunks;
 	int device_id;
+	erofs_off_t chunksize;
 };
 
 #define EROFS_CHUNK_NR_BUCKETS	\
@@ -64,6 +67,8 @@ struct erofs_chunkitem *erofs_get_unhashed_chunk(struct erofs_sb_info *sbi,
 	list_add_tail(&chunk->list, &chunkmgr->unhashed_chunks);
 	return chunk;
 }
+
+static void erofs_blob_enable_48bit(struct erofs_sb_info *sbi);
 
 #define FNV32_BASE ((unsigned int)0x811c9dc5)
 #define FNV32_PRIME ((unsigned int)0x01000193)
@@ -134,6 +139,8 @@ static struct erofs_chunkitem *erofs_get_chunk(struct erofs_sb_info *sbi,
 	erofs_mapbh(NULL, bh->block);
 	pos = erofs_btell(bh, false);
 	chunk->blkaddr = pos >> sbi->blkszbits;
+	if (chunk->blkaddr + BLK_ROUND_UP(sbi, size) > UINT32_MAX)
+		erofs_blob_enable_48bit(sbi);
 
 	erofs_dbg("Writing chunk (%llu bytes) to %llu (device %d)",
 		  size | 0ULL, chunk->blkaddr | 0ULL, chunk->device_id);
@@ -162,6 +169,31 @@ static struct erofs_chunkitem *erofs_get_chunk(struct erofs_sb_info *sbi,
 	return chunk;
 }
 
+struct erofs_chunkitem *erofs_blob_write_chunk(struct erofs_sb_info *sbi,
+		const void *buf, erofs_off_t chunksize)
+{
+	struct erofs_chunkmgr *cmgr = sbi->chunkmgr;
+
+	if (!cmgr || !cmgr->device_id || cmgr->chunksize != chunksize ||
+	    cmgr->device_id > sbi->extra_devices ||
+	    !sbi->devs[cmgr->device_id - 1].bmgr)
+		return ERR_PTR(-EINVAL);
+	return erofs_get_chunk(sbi, cmgr->device_id, (u8 *)buf, chunksize);
+}
+
+static void erofs_blob_enable_48bit(struct erofs_sb_info *sbi)
+{
+	u64 build_time;
+
+	if (erofs_sb_has_48bit(sbi))
+		return;
+	/* Importer initialization used non-48-bit time encoding.  Preserve the
+	 * complete build time while selecting a 48-bit compact-time base. */
+	build_time = sbi->epoch + sbi->build_time;
+	sbi->epoch = build_time > UINT32_MAX ? build_time - UINT32_MAX : 0;
+	sbi->build_time = build_time - sbi->epoch;
+	erofs_sb_set_48bit(sbi);
+}
 void erofs_inode_fixup_chunkformat(struct erofs_inode *inode)
 {
 	unsigned int unit, src;
@@ -174,8 +206,10 @@ void erofs_inode_fixup_chunkformat(struct erofs_inode *inode)
 		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;
 
 	_48bit = inode->u.chunkformat & EROFS_CHUNK_FORMAT_48BIT;
-	if (_48bit)
+	if (_48bit) {
+		erofs_blob_enable_48bit(inode->sbi);
 		return;
+	}
 
 	extent_count = inode->extent_isize / unit;
 	for (src = 0; src < extent_count; ++src) {
@@ -189,8 +223,10 @@ void erofs_inode_fixup_chunkformat(struct erofs_inode *inode)
 			break;
 		}
 	}
-	if (_48bit)
+	if (_48bit) {
 		inode->u.chunkformat |= EROFS_CHUNK_FORMAT_48BIT;
+		erofs_blob_enable_48bit(inode->sbi);
+	}
 }
 
 int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
@@ -202,8 +238,10 @@ int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
 	erofs_blk_t extent_end = EROFS_NULL_ADDR, chunkblks, addrmask;
 	erofs_blk_t extent_start = EROFS_NULL_ADDR;
 	erofs_off_t source_offset;
+	u8 *diskbuf;
 	unsigned int dst, src, unit, zeroedlen;
 	bool _48bit;
+	int ret;
 
 	if (inode->u.chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
 		unit = sizeof(struct erofs_inode_chunk_index);
@@ -212,6 +250,9 @@ int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
 
 	chunkblks = 1ULL << (inode->u.chunkformat & EROFS_CHUNK_FORMAT_BLKBITS_MASK);
 	_48bit = inode->u.chunkformat & EROFS_CHUNK_FORMAT_48BIT;
+	diskbuf = malloc(inode->extent_isize);
+	if (!diskbuf)
+		return -ENOMEM;
 	for (dst = src = 0; dst < inode->extent_isize;
 	     src += sizeof(void *), dst += unit) {
 		struct erofs_chunkitem *chunk;
@@ -249,9 +290,9 @@ int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
 		DBG_BUGON(!_48bit && idx.startblk_hi);
 
 		if (unit == EROFS_BLOCK_MAP_ENTRY_SIZE)
-			memcpy(inode->chunkindexes + dst, &idx.startblk_lo, unit);
+			memcpy(diskbuf + dst, &idx.startblk_lo, unit);
 		else
-			memcpy(inode->chunkindexes + dst, &idx, sizeof(idx));
+			memcpy(diskbuf + dst, &idx, sizeof(idx));
 	}
 	if (extent_start != EROFS_NULL_ADDR) {
 		extent_end = min(extent_end, extent_start + remaining_blks);
@@ -262,8 +303,9 @@ int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
 					 source_offset, zeroedlen);
 	}
 	off = roundup(off, unit);
-	return erofs_io_pwrite(vf, inode->chunkindexes,
-			       off, inode->extent_isize);
+	ret = erofs_io_pwrite(vf, diskbuf, off, inode->extent_isize);
+	free(diskbuf);
+	return ret;
 }
 
 int erofs_blob_mergechunks(struct erofs_inode *inode, unsigned int chunkbits,
@@ -271,6 +313,7 @@ int erofs_blob_mergechunks(struct erofs_inode *inode, unsigned int chunkbits,
 {
 	struct erofs_sb_info *sbi = inode->sbi;
 	unsigned int dst, src, unit, count;
+	u64 count64, chunksize;
 
 	if (new_chunkbits - sbi->blkszbits > EROFS_CHUNK_FORMAT_BLKBITS_MASK)
 		new_chunkbits = EROFS_CHUNK_FORMAT_BLKBITS_MASK + sbi->blkszbits;
@@ -282,7 +325,12 @@ int erofs_blob_mergechunks(struct erofs_inode *inode, unsigned int chunkbits,
 	else
 		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;
 
-	count = round_up(inode->i_size, 1ULL << new_chunkbits) >> new_chunkbits;
+	chunksize = 1ULL << new_chunkbits;
+	count64 = inode->i_size / chunksize +
+		!!(inode->i_size % chunksize);
+	if (count64 > INT_MAX / unit)
+		return -E2BIG;
+	count = count64;
 	for (dst = src = 0; dst < count; ++dst) {
 		*((void **)inode->chunkindexes + dst) =
 			*((void **)inode->chunkindexes + src);
@@ -295,6 +343,21 @@ int erofs_blob_mergechunks(struct erofs_inode *inode, unsigned int chunkbits,
 out:
 	inode->u.chunkformat = (chunkbits - sbi->blkszbits) |
 		(inode->u.chunkformat & ~EROFS_CHUNK_FORMAT_BLKBITS_MASK);
+	return 0;
+}
+
+static int erofs_blob_count_chunks(erofs_off_t size, unsigned int chunkbits,
+				   unsigned int unit, unsigned int *count)
+{
+	const size_t memunit = max(sizeof(struct erofs_inode_chunk_index),
+				   sizeof(struct erofs_chunkitem *));
+	u64 chunksize = 1ULL << chunkbits;
+	u64 count64;
+
+	count64 = size / chunksize + !!(size % chunksize);
+	if (count64 > INT_MAX / unit || count64 > SIZE_MAX / memunit)
+		return -E2BIG;
+	*count = count64;
 	return 0;
 }
 
@@ -331,36 +394,42 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 	unsigned int chunkbits = inode->u.chunkbits;
 	unsigned int count, unit;
 	struct erofs_chunkitem *chunk, *lastch;
-	struct erofs_inode_chunk_index *idx;
+	struct erofs_chunkitem **idx;
 	erofs_off_t pos, len, chunksize, interval_start;
 	erofs_blk_t minextblks;
 	u8 *chunkdata;
 	int ret;
 
-	/* if the file is fully sparsed, use one big chunk instead */
-	if (lseek(fd, startoff, SEEK_DATA) < 0 && errno == ENXIO) {
+	/* if the file is fully sparsed, use one big chunk unless exact indexes
+	 * were explicitly requested. */
+	if (cfg.c_force_chunkformat != FORCE_INODE_CHUNK_INDEXES &&
+	    lseek(fd, startoff, SEEK_DATA) < 0 && errno == ENXIO) {
 		chunkbits = ilog2(inode->i_size - 1) + 1;
 		if (chunkbits < sbi->blkszbits)
 			chunkbits = sbi->blkszbits;
 	}
 	if (chunkbits - sbi->blkszbits > EROFS_CHUNK_FORMAT_BLKBITS_MASK)
 		chunkbits = EROFS_CHUNK_FORMAT_BLKBITS_MASK + sbi->blkszbits;
-	chunksize = 1ULL << chunkbits;
-	count = DIV_ROUND_UP(inode->i_size, chunksize);
-
 	if (device_id)
 		inode->u.chunkformat |= EROFS_CHUNK_FORMAT_INDEXES;
 	if (inode->u.chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
 		unit = sizeof(struct erofs_inode_chunk_index);
 	else
 		unit = EROFS_BLOCK_MAP_ENTRY_SIZE;
+	chunksize = 1ULL << chunkbits;
+	ret = erofs_blob_count_chunks(inode->i_size, chunkbits, unit, &count);
+	if (ret) {
+		erofs_err("%s: too many chunk indexes", inode->i_srcpath);
+		return ret;
+	}
 
 	chunkdata = malloc(chunksize);
 	if (!chunkdata)
 		return -ENOMEM;
 
 	inode->extent_isize = count * unit;
-	inode->chunkindexes = malloc(count * max(sizeof(*idx), sizeof(void *)));
+	inode->chunkindexes = malloc(count *
+		max(sizeof(struct erofs_inode_chunk_index), sizeof(*idx)));
 	if (!inode->chunkindexes) {
 		ret = -ENOMEM;
 		goto err;
@@ -400,7 +469,7 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 				interval_start = pos;
 			}
 			do {
-				*(void **)idx++ = &erofs_holechunk;
+				*idx++ = &erofs_holechunk;
 				pos += chunksize;
 			} while (pos < offset);
 			DBG_BUGON(pos != offset);
@@ -427,12 +496,17 @@ int erofs_blob_write_chunked_file(struct erofs_inode *inode, int fd,
 						&minextblks);
 			interval_start = pos;
 		}
-		*(void **)idx++ = chunk;
+		*idx++ = chunk;
 		lastch = chunk;
 	}
 	erofs_update_minextblks(sbi, interval_start, pos, &minextblks);
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	free(chunkdata);
+	if (cfg.c_force_chunkformat == FORCE_INODE_CHUNK_INDEXES) {
+		inode->u.chunkformat = EROFS_CHUNK_FORMAT_INDEXES |
+			(chunkbits - sbi->blkszbits);
+		return 0;
+	}
 	return erofs_blob_mergechunks(inode, chunkbits,
 				      ilog2(minextblks) + sbi->blkszbits);
 err:
@@ -448,7 +522,8 @@ int erofs_write_zero_inode(struct erofs_inode *inode)
 	unsigned int chunkbits = ilog2(inode->i_size - 1) + 1;
 	unsigned int count;
 	erofs_off_t chunksize, len, pos;
-	struct erofs_inode_chunk_index *idx;
+	struct erofs_chunkitem **idx;
+	int ret;
 
 	if (chunkbits < sbi->blkszbits)
 		chunkbits = sbi->blkszbits;
@@ -458,10 +533,14 @@ int erofs_write_zero_inode(struct erofs_inode *inode)
 	inode->u.chunkformat |= chunkbits - sbi->blkszbits;
 
 	chunksize = 1ULL << chunkbits;
-	count = DIV_ROUND_UP(inode->i_size, chunksize);
+	ret = erofs_blob_count_chunks(inode->i_size, chunkbits,
+				      EROFS_BLOCK_MAP_ENTRY_SIZE, &count);
+	if (ret)
+		return ret;
 
 	inode->extent_isize = count * EROFS_BLOCK_MAP_ENTRY_SIZE;
-	idx = calloc(count, max(sizeof(*idx), sizeof(void *)));
+	idx = calloc(count, max(sizeof(struct erofs_inode_chunk_index),
+				 sizeof(*idx)));
 	if (!idx)
 		return -ENOMEM;
 	inode->chunkindexes = idx;
@@ -477,7 +556,7 @@ int erofs_write_zero_inode(struct erofs_inode *inode)
 			return PTR_ERR(chunk);
 		}
 
-		*(void **)idx++ = chunk;
+		*idx++ = chunk;
 	}
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	return 0;
@@ -488,10 +567,11 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 	struct erofs_sb_info *sbi = inode->sbi;
 	unsigned int chunkbits = ilog2(inode->i_size - 1) + 1;
 	unsigned int count, unit, device_id;
-	struct erofs_inode_chunk_index *idx;
+	struct erofs_chunkitem **idx;
 	struct erofs_buffer_head *bh;
 	erofs_off_t chunksize, len, pos;
 	erofs_blk_t blkaddr;
+	int ret;
 
 	if (chunkbits < sbi->blkszbits)
 		chunkbits = sbi->blkszbits;
@@ -518,10 +598,13 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 		erofs_bdrop(bh, false);
 	}
 	chunksize = 1ULL << chunkbits;
-	count = DIV_ROUND_UP(inode->i_size, chunksize);
+	ret = erofs_blob_count_chunks(inode->i_size, chunkbits, unit, &count);
+	if (ret)
+		return ret;
 
 	inode->extent_isize = count * unit;
-	idx = calloc(count, max(sizeof(*idx), sizeof(void *)));
+	idx = calloc(count, max(sizeof(struct erofs_inode_chunk_index),
+				 sizeof(*idx)));
 	if (!idx)
 		return -ENOMEM;
 	inode->chunkindexes = idx;
@@ -539,7 +622,7 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 			return PTR_ERR(chunk);
 		}
 
-		*(void **)idx++ = chunk;
+		*idx++ = chunk;
 		blkaddr += erofs_blknr(sbi, len);
 		data_offset += len;
 	}
@@ -551,7 +634,7 @@ int tarerofs_write_chunkes(struct erofs_inode *inode, erofs_off_t data_offset)
 	if (blkaddr > UINT32_MAX) {
 		inode->u.chunkformat |= EROFS_CHUNK_FORMAT_48BIT;
 		erofs_info("48-bit block addressin enabled for indexing larger tar");
-		erofs_sb_set_48bit(sbi);
+		erofs_blob_enable_48bit(sbi);
 	}
 	inode->datalayout = EROFS_INODE_CHUNK_BASED;
 	return 0;
@@ -602,37 +685,70 @@ static int erofs_insert_zerochunk(struct erofs_chunkmgr *cmgr,
 
 int erofs_blob_init_device(struct erofs_sb_info *sbi, int device_id)
 {
+	struct erofs_device_info *dif;
 	struct erofs_bufmgr *bmgr;
 	struct erofs_vfile *vf;
-	int fd, ret;
+	struct stat st;
+	int fd, flags, ret;
 
-	if (!device_id || sbi->devs[device_id - 1].bmgr)
+	if (!device_id || device_id > sbi->extra_devices)
+		return -EINVAL;
+	dif = &sbi->devs[device_id - 1];
+	if (dif->bmgr)
 		return 0;
+	if (!dif->src_path)
+		return -EINVAL;
+	if (!stat(dif->src_path, &st) &&
+	    !S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode)) {
+		erofs_err("blob device %s is neither a regular file nor a block device",
+			  dif->src_path);
+		return -EINVAL;
+	}
 
 	/* TODO: move it into (struct erofs_device_info) */
-	vf = malloc(sizeof(struct erofs_vfile));
-	if (!vf)
-		return -ENOMEM;
-
-	fd = open(sbi->devs[device_id - 1].src_path,
-		  O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
-	if (fd < 0) {
+	fd = open(dif->src_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY |
+		  O_NONBLOCK, 0666);
+	if (fd < 0)
+		return -errno;
+	if (fstat(fd, &st)) {
 		ret = -errno;
-		goto err_vf;
+		goto err_fd;
+	}
+	if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode)) {
+		erofs_err("blob device %s is neither a regular file nor a block device",
+			  dif->src_path);
+		ret = -EINVAL;
+		goto err_fd;
+	}
+	flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)) {
+		ret = -errno;
+		goto err_fd;
+	}
+	if (lseek(fd, 0, SEEK_CUR) < 0) {
+		ret = -errno;
+		erofs_err("blob device %s is not seekable: %s",
+			  dif->src_path, erofs_strerror(ret));
+		goto err_fd;
+	}
+	vf = malloc(sizeof(*vf));
+	if (!vf) {
+		ret = -ENOMEM;
+		goto err_fd;
 	}
 	*vf = (struct erofs_vfile){ .fd = fd };
 	bmgr = erofs_buffer_init(sbi, 0, vf);
 	if (!bmgr) {
 		ret = -ENOMEM;
-		goto err_fd;
+		goto err_vf;
 	}
-	sbi->devs[device_id - 1].bmgr = bmgr;
+	dif->bmgr = bmgr;
 	return 0;
 
-err_fd:
-	close(fd);
 err_vf:
 	free(vf);
+err_fd:
+	close(fd);
 	return ret;
 }
 
@@ -657,6 +773,7 @@ int erofs_blob_init(struct erofs_sb_info *sbi, int blobdev_id,
 				goto err_out;
 		}
 		cmgr->device_id = blobdev_id;
+		cmgr->chunksize = chunkbits_zero ? 1ULL << chunkbits_zero : 0;
 		sbi->chunkmgr = cmgr;
 	}
 	return 0;

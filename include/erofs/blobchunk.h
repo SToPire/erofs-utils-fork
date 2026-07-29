@@ -17,6 +17,8 @@ extern "C"
 struct erofs_chunkitem *erofs_get_unhashed_chunk(struct erofs_sb_info *sbi,
 		unsigned int device_id, erofs_blk_t blkaddr,
 		erofs_off_t sourceoffset);
+struct erofs_chunkitem *erofs_blob_write_chunk(struct erofs_sb_info *sbi,
+		const void *buf, erofs_off_t chunksize);
 void erofs_inode_fixup_chunkformat(struct erofs_inode *inode);
 int erofs_write_chunk_indexes(struct erofs_inode *inode, struct erofs_vfile *vf,
 			      erofs_off_t off);

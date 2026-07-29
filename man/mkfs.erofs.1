@@ -107,7 +107,12 @@ Force generation of extended (64-byte) inodes.
 Force generation of inode chunk format as a 4-byte block address array.
 .TP
 .BI force-chunk-indexes
-Forcely generate inode chunk format as an 8-byte chunk index (with device ID).
+Forcely generate inode chunk format as an 8-byte chunk index (with device ID)
+and preserve the chunk size requested by
+.BR \-\-chunksize .
+In file-delta rebuild mode, non-target regular files preserve their inherited
+parent chunk size; the requested size applies to TARGETs, STOREs, and newly
+written blob data.
 .TP
 .BI [^]fragdedupe\fR[\fP= <inode|full> \fR]\fP
 Set the mode for fragment data deduplication.  It's effective only when
@@ -338,6 +343,55 @@ Note that \fBrvsp\fR takes precedence over \fB--tar=i\fR or \fB--tar=headerball\
 .I Rebuild mode
 Only \fBrvsp\fR is supported.
 .RE
+.TP
+.BI "\-\-file-delta=" FORMAT:TARGET:SOURCE
+Rebuild exactly one parent index image while applying a backend-specific delta
+\fISOURCE\fR to \fITARGET\fR.  This option requires
+.BR \-Eforce-chunk-indexes ,
+.BR \-\-chunksize ,
+and
+.BR \-\-blobdev .
+It cannot be used with
+.BR \-\-incremental
+or non-default rebuild data modes.  It also rejects
+.BR \-\-xattr-inode-digest
+and parents carrying inode-digest xattrs because historical external blobs are
+not opened to recompute full-file digests.
+
+\fITARGET\fR is a normalized absolute path in the parent index.  It must name
+a non-empty, non-hard-linked regular file using device-indexed
+\fBCHUNK_BASED\fR layout.
+The target chunk size and \fB\-\-chunksize\fR must be equal, and the target
+size must be chunk aligned.  A target can be specified only once and cannot
+contain a colon.  \fIFORMAT\fR determines how \fISOURCE\fR is validated and
+read.
+
+Each delta record replaces one target chunk.  Non-zero payload is stored
+compactly in \fB\-\-blobdev\fR;
+identical chunks in this new blob can share one physical location.  The output
+inode inherits every clean chunk index from
+the parent and points changed non-zero chunks to the newly appended blob
+location.  Changed zero chunks become holes and consume no blob space.
+
+The parent must be index-only: every mapped non-empty regular-file chunk must
+carry an explicit external device ID.  Its device table is copied unchanged,
+each inherited mapping must fit within the corresponding device slot, and the
+new blob is appended as the last device.  The output is limited to 256 external
+devices.  \fISOURCE\fR is build input only and is not referenced by the output
+index.
+
+The path passed to \fB\-\-blobdev\fR must name a seekable regular file or block
+device.  Character devices, FIFOs, and other non-storage objects are rejected
+before payload is written.
+
+The single parent root's permissions, ownership, timestamps and extended
+attributes are inherited.  The filesystem block size is derived from the
+parent, so sub-4096-byte parent and delta chunk geometries do not require a
+redundant \fB-b\fR option.
+
+The source specification is the remainder after the second colon, so it may
+itself contain colons.  Repeated file-delta options must use distinct TARGET
+paths.  A source may be reused when the selected backend permits it.
 .TP
 .BI "\-\-max-extent-bytes=" #
 Specify maximum decompressed extent size in bytes. The default is unlimited.
