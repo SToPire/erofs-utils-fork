@@ -1198,10 +1198,13 @@ static int erofs_init_inode_xattrs(struct erofs_inode *vi)
 
 	ih = it.kaddr;
 	vi->xattr_shared_count = ih->h_shared_count;
-	vi->xattr_shared_xattrs = malloc(vi->xattr_shared_count * sizeof(uint));
-	if (!vi->xattr_shared_xattrs) {
-		erofs_put_metabuf(&it.buf);
-		return -ENOMEM;
+	if (vi->xattr_shared_count) {
+		vi->xattr_shared_xattrs = malloc(vi->xattr_shared_count *
+						 sizeof(uint));
+		if (!vi->xattr_shared_xattrs) {
+			erofs_put_metabuf(&it.buf);
+			return -ENOMEM;
+		}
 	}
 
 	/* let's skip ibody header */
@@ -1283,7 +1286,9 @@ static int erofs_listxattr_foreach(struct erofs_xattr_iter *it)
 		return -ERANGE;
 
 	memcpy(it->buffer + it->buffer_ofs, prefix, prefix_len);
-	memcpy(it->buffer + it->buffer_ofs + prefix_len, infix, infix_len);
+	if (infix_len)
+		memcpy(it->buffer + it->buffer_ofs + prefix_len, infix,
+		       infix_len);
 	it->buffer_ofs += prefix_len + infix_len;
 
 	/* 2. handle xattr name */

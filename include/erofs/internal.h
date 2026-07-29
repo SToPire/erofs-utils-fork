@@ -203,12 +203,14 @@ EROFS_FEATURE_FUNCS(ishare_xattrs, compat, COMPAT_ISHARE_XATTRS)
 #define EROFS_I_Z_INITED	(1 << EROFS_I_Z_INITED_BIT)
 
 struct erofs_diskbuf;
+struct erofs_file_delta;
 
 #define EROFS_INODE_DATA_SOURCE_NONE		0
 #define EROFS_INODE_DATA_SOURCE_LOCALPATH	1
 #define EROFS_INODE_DATA_SOURCE_DISKBUF		2
 #define EROFS_INODE_DATA_SOURCE_RESVSP		3
 #define EROFS_INODE_DATA_SOURCE_REBUILD_BLOB	4
+#define EROFS_INODE_DATA_SOURCE_FILE_DELTA	5
 
 enum erofs_idata_type {
 	EROFS_IDATA_TYPE_RAW,
@@ -262,6 +264,7 @@ struct erofs_inode {
 	};
 	char *rebuild_blobpath;
 	erofs_off_t rebuild_src_dataoff;
+	struct erofs_file_delta *file_delta;
 	unsigned char datalayout;
 	unsigned char inode_isize;
 	/* inline tail-end packing size */
@@ -274,6 +277,7 @@ struct erofs_inode {
 	/* OVL: non-merge dir that may contain whiteout entries */
 	bool whiteouts;
 	bool dot_omitted;
+	bool incremental_copyup;
 
 	unsigned int xattr_isize;
 	unsigned int extent_isize;

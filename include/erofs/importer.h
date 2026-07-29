@@ -12,6 +12,8 @@ extern "C"
 
 #include "internal.h"
 
+struct erofs_file_delta_manager;
+
 enum {
 	EROFS_FORCE_INODE_COMPACT = 1,
 	EROFS_FORCE_INODE_EXTENDED,
@@ -69,6 +71,7 @@ struct erofs_importer {
 	struct erofs_importer_params *params;
 	struct erofs_sb_info *sbi;
 	struct erofs_inode *root;
+	struct erofs_file_delta_manager *file_deltas;
 };
 
 void erofs_importer_preset(struct erofs_importer_params *params);

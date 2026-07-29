@@ -341,6 +341,28 @@ Note that \fBrvsp\fR takes precedence over \fB--tar=i\fR or \fB--tar=headerball\
 Only \fBrvsp\fR is supported.
 .RE
 .TP
+.BI "\-\-file-delta=" dm-persistent:TARGET:STORE
+Apply a Linux dm-persistent snapshot exception store version 1 as a forward
+file delta during a local-directory incremental build.  Each exception
+replaces the complete \fITARGET\fR chunk identified by \fBold_chunk\fR with
+the \fISTORE\fR chunk identified by \fBnew_chunk\fR; ranges without an
+exception inherit data from the lower EROFS inode.
+
+\fITARGET\fR must be a normalized absolute image path naming an existing
+regular lower file with the \fBFLAT_PLAIN\fR layout.  It need not exist in
+SOURCE, but if it does, the build fails rather than choosing one input
+implicitly.  The target size is fixed by the lower inode.  A target can be
+specified only once.  Hard-linked TARGET inodes are not supported.
+
+\fISTORE\fR can be a regular file or a block device.  The caller must ensure
+that it differs from DESTINATION and remains unchanged for the complete build.
+Its header must have
+magic \fB0x70416e53\fR,
+\fBvalid=1\fR, version 1, and a power-of-two chunk size.  The current
+implementation limits a chunk to 64 MiB and a store to 16777216 exceptions.
+The store path is the remainder after the second colon, so it may itself
+contain colons.
+.TP
 .BI "\-\-max-extent-bytes=" #
 Specify maximum decompressed extent size in bytes. The default is unlimited.
 .TP

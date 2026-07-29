@@ -26,6 +26,7 @@
 #include "erofs/compress_hints.h"
 #include "erofs/blobchunk.h"
 #include "../lib/compressor.h"
+#include "../lib/liberofs_file_delta.h"
 #include "../lib/liberofs_gzran.h"
 #include "../lib/liberofs_metabox.h"
 #include "../lib/liberofs_oci.h"
@@ -105,6 +106,7 @@ static struct option long_options[] = {
 	{"MZ", optional_argument, NULL, 537},
 	{"xattr-prefix", required_argument, NULL, 538},
 	{"xattr-inode-digest", optional_argument, NULL, 539},
+	{"file-delta", required_argument, NULL, 540},
 	{0, 0, 0, 0},
 };
 
@@ -201,6 +203,7 @@ static void usage(int argc, char **argv)
 		" --dsunit=#             align all data block addresses to multiples of #\n"
 		" --exclude-path=X       avoid including file X (X = exact literal path)\n"
 		" --exclude-regex=X      avoid including files that match X (X = regular expression)\n"
+		" --file-delta=X         apply X=dm-persistent:TARGET:STORE to a lower file\n"
 #ifdef HAVE_LIBSELINUX
 		" --file-contexts=X      specify a file contexts file to setup selinux labels\n"
 #endif
@@ -326,6 +329,7 @@ static enum {
 
 static unsigned int rebuild_src_count;
 static LIST_HEAD(rebuild_src_list);
+static LIST_HEAD(file_deltas);
 static u8 fixeduuid[16];
 static bool valid_fixeduuid;
 static unsigned int dsunit;
@@ -1497,6 +1501,14 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			}
 			has_xattr_prefix_opt = true;
 			break;
+		case 540:
+			err = erofs_file_delta_parse_spec(&file_deltas, optarg);
+			if (err) {
+				erofs_err("invalid --file-delta=%s: %s", optarg,
+					  erofs_strerror(err));
+				return err;
+			}
+			break;
 		case 'V':
 			version();
 			exit(0);
@@ -1555,6 +1567,12 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 					  tarerofs_decoder);
 		if (err)
 			return err;
+	}
+
+	if (!list_empty(&file_deltas) &&
+	    (!incremental_mode || source_mode != EROFS_MKFS_SOURCE_LOCALDIR)) {
+		erofs_err("--file-delta requires --incremental with a local directory SOURCE");
+		return -EINVAL;
 	}
 
 	if (quiet) {
@@ -1768,9 +1786,11 @@ static void erofs_mkfs_showsummaries(void)
 int main(int argc, char **argv)
 {
 	struct erofs_importer_params importer_params;
+	struct erofs_file_delta_manager file_delta_mgr = {};
 	struct erofs_importer importer = {
 		.params = &importer_params,
 		.sbi = &g_sbi,
+		.file_deltas = &file_delta_mgr,
 	};
 	struct erofs_inode *root = NULL;
 	bool tar_index_512b = false;
@@ -1873,6 +1893,12 @@ int main(int argc, char **argv)
 		err = erofs_mkfs_load_fs(&g_sbi, dsunit);
 	if (err)
 		goto exit;
+	if (!list_empty(&file_deltas)) {
+		err = erofs_file_delta_manager_init(&file_delta_mgr, &g_sbi,
+						    &file_deltas);
+		if (err)
+			goto exit;
+	}
 
 	/* Use the user-defined UUID or generate one for clean builds */
 	if (valid_fixeduuid)
@@ -2074,6 +2100,8 @@ int main(int argc, char **argv)
 exit:
 	if (root)
 		erofs_iput(root);
+	erofs_file_delta_manager_exit(&file_delta_mgr);
+	erofs_file_delta_cleanup(&file_deltas);
 	z_erofs_dedupe_exit();
 	blklst = erofs_blocklist_close();
 	if (blklst)

@@ -27,6 +27,7 @@
 #include "erofs/importer.h"
 #include "liberofs_cache.h"
 #include "liberofs_compress.h"
+#include "liberofs_file_delta.h"
 #include "liberofs_fragments.h"
 #include "liberofs_metabox.h"
 #include "liberofs_private.h"
@@ -1498,10 +1499,39 @@ struct erofs_mkfs_job_ndir_ctx {
 	u64 fpos;
 };
 
+static int erofs_write_file_delta(struct erofs_inode *inode)
+{
+	struct erofs_vfile *vf;
+	off_t off;
+	int ret;
+
+	vf = erofs_file_delta_open_vfile(inode->file_delta);
+	if (IS_ERR(vf))
+		return PTR_ERR(vf);
+
+	off = erofs_io_lseek(vf, 0, SEEK_SET);
+	if (off < 0) {
+		ret = off;
+		goto out;
+	}
+	if (off) {
+		ret = -EIO;
+		goto out;
+	}
+	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
+	ret = erofs_write_unencoded_data(inode, vf, 0, true, false);
+out:
+	erofs_io_close(vf);
+	return ret;
+}
+
 static int erofs_mkfs_job_write_file(struct erofs_mkfs_job_ndir_ctx *ctx)
 {
 	struct erofs_inode *inode = ctx->inode;
 	int ret;
+
+	if (inode->datasource == EROFS_INODE_DATA_SOURCE_FILE_DELTA)
+		return erofs_write_file_delta(inode);
 
 	if (inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF &&
 	    lseek(ctx->fd, ctx->fpos, SEEK_SET) < 0) {
@@ -1574,7 +1604,8 @@ static int erofs_mkfs_handle_nondirectory(const struct erofs_mkfs_btctx *btctx,
 	} else if (inode->i_size) {
 		if (inode->datasource == EROFS_INODE_DATA_SOURCE_RESVSP)
 			ret = erofs_inode_reserve_data_blocks(inode);
-		else if (ctx->fd >= 0)
+		else if (inode->datasource ==
+			 EROFS_INODE_DATA_SOURCE_FILE_DELTA || ctx->fd >= 0)
 			ret = erofs_mkfs_job_write_file(ctx);
 	}
 	if (ret)
@@ -1943,13 +1974,20 @@ static int erofs_prepare_dir_inode(const struct erofs_mkfs_btctx *ctx,
 	}
 
 	if (!ctx->rebuild) {
-		ret = erofs_mkfs_import_localdir(im, dir,
-						 &nr_subdirs, &i_nlink);
+		if (!dir->incremental_copyup) {
+			ret = erofs_mkfs_import_localdir(im, dir,
+							 &nr_subdirs, &i_nlink);
+			if (ret)
+				return ret;
+		}
+		ret = erofs_file_delta_copyup_targets(im, dir, &nr_subdirs,
+						      &i_nlink);
 		if (ret)
 			return ret;
 	}
 
-	if (ctx->incremental && dir->dev == sbi->dev && !dir->opaque) {
+	if (ctx->incremental && dir->dev == sbi->dev &&
+	    (!dir->opaque || dir->incremental_copyup)) {
 		ret = erofs_rebuild_load_basedir(dir, &nr_subdirs, &i_nlink);
 		if (ret)
 			return ret;
@@ -1988,12 +2026,12 @@ static int erofs_prepare_dir_inode(const struct erofs_mkfs_btctx *ctx,
 	return 0;
 }
 
-static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
+static int erofs_set_inode_fingerprint(struct erofs_inode *inode,
+				       struct erofs_vfile *vf,
 				       erofs_off_t pos)
 {
 	u8 ishare_xattr_prefix_id = inode->sbi->ishare_xattr_prefix_id;
 	erofs_off_t remaining = inode->i_size;
-	struct erofs_vfile vf = { .fd = fd };
 	struct sha256_state md;
 	u8 out[32 + sizeof("sha256:") - 1];
 	int ret;
@@ -2004,7 +2042,7 @@ static int erofs_set_inode_fingerprint(struct erofs_inode *inode, int fd,
 	do {
 		u8 buf[32768];
 
-		ret = erofs_io_pread(&vf, buf,
+		ret = erofs_io_pread(vf, buf,
 				     min_t(u64, remaining, sizeof(buf)), pos);
 		if (ret < 0)
 			return ret;
@@ -2028,6 +2066,18 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 	int ret;
 
 	if (S_ISREG(inode->i_mode) && inode->i_size) {
+		if (inode->datasource == EROFS_INODE_DATA_SOURCE_FILE_DELTA) {
+			struct erofs_vfile *vf;
+
+			vf = erofs_file_delta_open_vfile(inode->file_delta);
+			if (IS_ERR(vf))
+				return PTR_ERR(vf);
+			ret = erofs_set_inode_fingerprint(inode, vf, 0);
+			erofs_io_close(vf);
+			if (ret < 0)
+				return ret;
+			goto out;
+		}
 		switch (inode->datasource) {
 		case EROFS_INODE_DATA_SOURCE_DISKBUF:
 			ctx.fd = erofs_diskbuf_getfd(inode->i_diskbuf, &ctx.fpos);
@@ -2049,7 +2099,9 @@ static int erofs_mkfs_begin_nondirectory(const struct erofs_mkfs_btctx *btctx,
 			goto out;
 		}
 
-		ret = erofs_set_inode_fingerprint(inode, ctx.fd, ctx.fpos);
+		ret = erofs_set_inode_fingerprint(inode,
+					&(struct erofs_vfile){ .fd = ctx.fd },
+					ctx.fpos);
 		if (ret < 0)
 			return ret;
 
@@ -2101,7 +2153,8 @@ static int erofs_mkfs_handle_inode(const struct erofs_mkfs_btctx *ctx,
 			return ret;
 	}
 
-	if (!ctx->rebuild && !params->no_xattrs) {
+	if (!ctx->rebuild && !params->no_xattrs &&
+	    !inode->incremental_copyup) {
 		ret = erofs_scan_file_xattrs(inode);
 		if (ret < 0)
 			return ret;
