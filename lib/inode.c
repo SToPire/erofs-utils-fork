@@ -651,7 +651,7 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 {
 	struct erofs_sb_info *sbi = inode->sbi;
 	struct erofs_buffer_head *bh;
-	struct erofs_bufmgr *bmgr;
+	struct erofs_vfile *vout;
 	erofs_off_t remaining, pos;
 	unsigned int len;
 	int ret;
@@ -681,15 +681,14 @@ static int erofs_write_unencoded_data(struct erofs_inode *inode,
 
 	bh = inode->bh_data;
 	if (bh) {
-		bmgr = (struct erofs_bufmgr *)bh->block->buffers.fsprivate;
-		pos = erofs_btell(bh, false);
-		if (__erofs_unlikely(pos == EROFS_NULL_ADDR))
-			return -EFAULT;
+		ret = erofs_bh_get_vfpos(bh, &vout, &pos);
+		if (ret)
+			return ret;
 
 		do {
 			len = min_t(u64, remaining,
 				    round_down(UINT_MAX, 1U << sbi->blkszbits));
-			ret = erofs_io_xcopy(bmgr->vf, (off_t)pos, vf, len, noseek);
+			ret = erofs_io_xcopy(vout, (off_t)pos, vf, len, noseek);
 			if (ret)
 				return ret;
 			pos += len;

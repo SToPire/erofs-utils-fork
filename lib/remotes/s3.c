@@ -15,6 +15,7 @@
 #include "erofs/internal.h"
 #include "erofs/print.h"
 #include "erofs/inode.h"
+#include "../liberofs_cache.h"
 #include "../liberofs_chunk.h"
 #include "erofs/diskbuf.h"
 #include "erofs/importer.h"
@@ -1039,8 +1040,11 @@ static int s3erofs_remote_getobject(struct erofs_importer *im,
 	struct erofs_sb_info *sbi = inode->sbi;
 	struct s3erofs_curl_request req = { .method = "GET", };
 	struct s3erofs_curl_getobject_resp resp;
+	struct erofs_buffer_head *bh;
 	struct erofs_vfile vf;
 	u64 diskbuf_off;
+	unsigned int padding;
+	bool direct_write = false;
 	int ret;
 
 	ret = s3erofs_prepare_url(&req, s3->endpoint, bucket, key, NULL,
@@ -1061,8 +1065,16 @@ static int s3erofs_remote_getobject(struct erofs_importer *im,
 				im->params->ddev_id_def);
 		if (ret)
 			return ret;
-		resp.vf = &sbi->bdev;
-		resp.pos = erofs_pos(inode->sbi, inode->u.i_blkaddr);
+		bh = inode->bh_data;
+		if (bh) {
+			ret = erofs_bh_get_vfpos(bh, &resp.vf, &resp.pos);
+			if (ret)
+				return ret;
+		} else {
+			DBG_BUGON(inode->i_size);
+			resp.vf = &sbi->bdev;
+		}
+		direct_write = true;
 		inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
 	} else {
 		if (!inode->i_diskbuf) {
@@ -1094,7 +1106,18 @@ static int s3erofs_remote_getobject(struct erofs_importer *im,
 	}
 	if (ret)
 		return ret;
-	return resp.pos != resp.end ? -EIO : 0;
+	if (resp.pos != resp.end)
+		return -EIO;
+	if (direct_write) {
+		padding = erofs_blkoff(sbi, inode->i_size);
+		if (padding) {
+			padding = erofs_blksiz(sbi) - padding;
+			ret = erofs_io_fallocate(resp.vf, resp.pos, padding, true);
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
 }
 
 int s3erofs_build_trees(struct erofs_importer *im, struct erofs_s3 *s3,

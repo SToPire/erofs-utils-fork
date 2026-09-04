@@ -114,6 +114,18 @@ static inline erofs_off_t erofs_btell(struct erofs_buffer_head *bh, bool end)
 		(end ? list_next_entry(bh, list)->off : bh->off);
 }
 
+static inline int erofs_bh_get_vfpos(struct erofs_buffer_head *bh,
+				     struct erofs_vfile **vf, erofs_off_t *pos)
+{
+	struct erofs_bufmgr *bmgr = bh->block->buffers.fsprivate;
+
+	*pos = erofs_btell(bh, false);
+	if (__erofs_unlikely(*pos == EROFS_NULL_ADDR))
+		return -EFAULT;
+	*vf = bmgr->vf;
+	return 0;
+}
+
 static inline int erofs_bh_flush_generic_end(struct erofs_buffer_head *bh)
 {
 	list_del(&bh->list);
