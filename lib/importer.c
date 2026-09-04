@@ -120,7 +120,7 @@ int erofs_importer_flush_all(struct erofs_importer *im)
 	if (err)
 		return err;
 
-	err = erofs_metazone_flush(sbi);
+	err = erofs_metazone_prepare(sbi);
 	if (err)
 		return err;
 
@@ -129,6 +129,10 @@ int erofs_importer_flush_all(struct erofs_importer *im)
 	sbi->dif0.blocks = roundup(erofs_mapbh(sbi->bmgr, NULL), fsalignblks);
 
 	err = erofs_update_all_devices(sbi);
+	if (err)
+		return err;
+
+	err = erofs_metazone_flush(sbi);
 	if (err)
 		return err;
 

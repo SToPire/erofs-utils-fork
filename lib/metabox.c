@@ -12,10 +12,13 @@ const char *erofs_metabox_identifier = "metabox";
 struct erofs_metamgr {
 	struct erofs_vfile vf;
 	struct erofs_bufmgr *bmgr;
+	struct erofs_buffer_head *bh;
 };
 
 static void erofs_metamgr_exit(struct erofs_metamgr *m2gr)
 {
+	if (m2gr->bh)
+		erofs_bdrop(m2gr->bh, true);
 	DBG_BUGON(!m2gr->bmgr);
 	erofs_buffer_exit(m2gr->bmgr);
 	erofs_io_close(&m2gr->vf);
@@ -36,6 +39,7 @@ static int erofs_metamgr_init(struct erofs_sb_info *sbi,
 		erofs_io_close(&m2gr->vf);
 		return -ENOMEM;
 	}
+	m2gr->bh = NULL;
 	return 0;
 }
 
@@ -117,17 +121,19 @@ int erofs_metabox_iflush(struct erofs_importer *im)
 	return 0;
 }
 
-int erofs_metazone_flush(struct erofs_sb_info *sbi)
+int erofs_metazone_prepare(struct erofs_sb_info *sbi)
 {
 	struct erofs_metamgr *m2gr = sbi->m2gr;
 	struct erofs_buffer_head *bh;
-	struct erofs_bufmgr *m2bgr;
-	erofs_blk_t meta_blkaddr;
-	u64 length, pos_out;
-	int ret, count;
+	erofs_off_t pos_out;
+	u64 length;
+	int ret;
 
 	if (!m2gr)
 		return 0;
+	DBG_BUGON(m2gr->bh);
+
+	length = erofs_pos(sbi, erofs_mapbh(m2gr->bmgr, NULL));
 	bh = erofs_balloc(sbi->bmgr, DATA, 0, 0);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
@@ -137,17 +143,35 @@ int erofs_metazone_flush(struct erofs_sb_info *sbi)
 		erofs_bdrop(bh, true);
 		return -EFAULT;
 	}
-	meta_blkaddr = pos_out >> sbi->blkszbits;
-	sbi->metazone_startblk = meta_blkaddr;
-
-	m2bgr = m2gr->bmgr;
-	ret = erofs_bflush(m2bgr, NULL);
-	if (ret)
-		return ret;
-
-	length = erofs_mapbh(m2bgr, NULL) << sbi->blkszbits;
 	ret = erofs_bh_balloon(bh, length);
-	if (ret < 0)
+	if (ret < 0) {
+		erofs_bdrop(bh, true);
+		return ret;
+	}
+	m2gr->bh = bh;
+	sbi->metazone_startblk = pos_out >> sbi->blkszbits;
+	return 0;
+}
+
+int erofs_metazone_flush(struct erofs_sb_info *sbi)
+{
+	struct erofs_metamgr *m2gr = sbi->m2gr;
+	struct erofs_buffer_head *bh;
+	erofs_blk_t meta_blkaddr;
+	u64 length, pos_out;
+	int ret, count;
+
+	if (!m2gr)
+		return 0;
+	bh = m2gr->bh;
+	if (!bh)
+		return -EINVAL;
+	pos_out = erofs_btell(bh, false);
+	meta_blkaddr = pos_out >> sbi->blkszbits;
+	length = erofs_pos(sbi, erofs_mapbh(m2gr->bmgr, NULL));
+
+	ret = erofs_bflush(m2gr->bmgr, NULL);
+	if (ret)
 		return ret;
 
 	do {
@@ -158,6 +182,7 @@ int erofs_metazone_flush(struct erofs_sb_info *sbi)
 			break;
 		pos_out += count;
 	} while (length -= count);
+	m2gr->bh = NULL;
 	bh->op = &erofs_drop_directly_bhops;
 	erofs_bdrop(bh, false);
 	sbi->meta_blkaddr += meta_blkaddr;

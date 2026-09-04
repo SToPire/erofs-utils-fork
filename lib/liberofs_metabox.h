@@ -25,6 +25,7 @@ void erofs_metadata_exit(struct erofs_sb_info *sbi);
 int erofs_metadata_init(struct erofs_sb_info *sbi);
 struct erofs_bufmgr *erofs_metadata_bmgr(struct erofs_sb_info *sbi, bool mbox);
 int erofs_metabox_iflush(struct erofs_importer *im);
+int erofs_metazone_prepare(struct erofs_sb_info *sbi);
 int erofs_metazone_flush(struct erofs_sb_info *sbi);
 
 #endif

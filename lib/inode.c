@@ -1000,6 +1000,7 @@ static int erofs_prepare_inode_buffer(struct erofs_importer *im,
 	struct erofs_bufmgr *ibmgr;
 	unsigned int inodesize;
 	struct erofs_buffer_head *bh, *ibh;
+	bool pending_devaddr;
 
 	DBG_BUGON(inode->bh || inode->bh_inline);
 
@@ -1015,7 +1016,12 @@ static int erofs_prepare_inode_buffer(struct erofs_importer *im,
 	if (inode->extent_isize)
 		inodesize = roundup(inodesize, 8) + inode->extent_isize;
 
-	if (!erofs_is_special_identifier(inode->i_srcpath) && sbi->mxgr)
+	pending_devaddr = !is_inode_layout_compression(inode) &&
+		inode->datalayout != EROFS_INODE_CHUNK_BASED &&
+		((params->ddev_id_def && S_ISREG(inode->i_mode)) ||
+		 (params->dirdata_in_metazone && S_ISDIR(inode->i_mode)));
+	if (!erofs_is_special_identifier(inode->i_srcpath) && sbi->mxgr &&
+	    !pending_devaddr)
 		inode->in_metabox = true;
 	ibmgr = erofs_metadata_bmgr(sbi, inode->in_metabox) ?: sbi->bmgr;
 
